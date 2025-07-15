@@ -97,14 +97,35 @@ async function incrementalUpload(context) {
         const commitDir = path.join(tempDir, commit.hash);
         await fs.mkdir(commitDir, { recursive: true });
 
-        const { stdout: files } = await runCommand(`git -c core.quotepath=false diff-tree --no-commit-id --name-only -r ${commit.hash}`, workspaceRoot);
-        const changedFiles = files.trim().split('\n').filter(Boolean);
+        const { stdout: files } = await runCommand(`git -c core.quotepath=false show --name-status --pretty="" ${commit.hash}`, workspaceRoot);
+        const changedFilesWithStatus = files.trim().split('\n').filter(Boolean);
+        const deletedFiles = [];
 
-        for (const file of changedFiles) {
-            const sourcePath = path.join(workspaceRoot, file);
-            const destPath = path.join(commitDir, file);
-            await fs.mkdir(path.dirname(destPath), { recursive: true });
-            await fs.copyFile(sourcePath, destPath);
+        for (const line of changedFilesWithStatus) {
+            const parts = line.split('\t');
+            const status = parts[0];
+
+            if (status.startsWith('D')) {
+                deletedFiles.push(parts[1]);
+            } else if (status.startsWith('R')) {
+                deletedFiles.push(parts[1]); // old path
+                const newFile = parts[2]; // new path
+                const sourcePath = path.join(workspaceRoot, newFile);
+                const destPath = path.join(commitDir, newFile);
+                await fs.mkdir(path.dirname(destPath), { recursive: true });
+                await fs.copyFile(sourcePath, destPath);
+            } else { // A, M, C
+                const file = parts[1];
+                const sourcePath = path.join(workspaceRoot, file);
+                const destPath = path.join(commitDir, file);
+                await fs.mkdir(path.dirname(destPath), { recursive: true });
+                await fs.copyFile(sourcePath, destPath);
+            }
+        }
+
+        if (deletedFiles.length > 0) {
+            const deletedFilePath = path.join(commitDir, 'deleted.txt');
+            await fs.writeFile(deletedFilePath, deletedFiles.join('\n'));
         }
         logContent += `${commit.hash} ${commit.message}\n`;
     }
@@ -210,25 +231,42 @@ async function downloadChanges(context) {
 
             for (const commit of commitsToApply) {
                 const commitDir = path.join(tempDir, commit.hash);
+                const deletedFilePath = path.join(commitDir, 'deleted.txt');
 
-                // Копируем файлы из папки коммита в рабочую директорию
-                await copyRecursive(commitDir, workspaceRoot);
-
-                // Получаем список всех файлов, которые были в этом коммите
-                const filesToCommit = await getAllFilesRecursive(commitDir);
-
-                // Добавляем в индекс только эти файлы
-                if (filesToCommit.length > 0) {
-                    const filesToAdd = filesToCommit.map(f => `"${f.replace(/\//g, '/')}"`).join(' ');
-                    await runCommand(`git add -- ${filesToAdd}`, workspaceRoot);
-
-                    // Экранируем кавычки в сообщении коммита
-                    const escapedMessage = commit.message.replace(/"/g, '\"');
-                    await runCommand(`git commit -m "${escapedMessage}"`, workspaceRoot);
-                } else {
-                    // Если в коммите не было файлов (например, пустой коммит), можно его пропустить
-                    vscode.window.showInformationMessage(`Skipping empty commit: ${commit.hash}`);
+                if (fsSync.existsSync(deletedFilePath)) {
+                    const deletedFilesContent = await fs.readFile(deletedFilePath, 'utf-8');
+                    const deletedFiles = deletedFilesContent.trim().split('\n').filter(Boolean);
+                    if (deletedFiles.length > 0) {
+                        const filesToRemove = [];
+                        for (const file of deletedFiles) {
+                            if (fsSync.existsSync(path.join(workspaceRoot, file))) {
+                                filesToRemove.push(`"${file.replace(/\\//g, '/')}"`);
+                            } else {
+                                vscode.window.showWarningMessage(`File scheduled for deletion not found, skipping: ${file}`);
+                            }
+                        }
+                        if (filesToRemove.length > 0) {
+                            await runCommand(`git rm -- ${filesToRemove.join(' ')}`, workspaceRoot);
+                        }
+                    }
                 }
+
+                // Копируем файлы из папки коммита в рабочую директорию, исключая deleted.txt
+                await copyRecursive(commitDir, workspaceRoot, ['deleted.txt']);
+
+                // Получаем список всех файлов, которые были в этом коммите (кроме deleted.txt)
+                const filesToCommit = (await getAllFilesRecursive(commitDir)).filter(f => f !== 'deleted.txt');
+
+                // Добавляем в индекс только измененные/новые файлы
+                if (filesToCommit.length > 0) {
+                    const filesToAdd = filesToCommit.map(f => `"${f.replace(/\\//g, '/')}"`).join(' ');
+                    await runCommand(`git add -- ${filesToAdd}`, workspaceRoot);
+                }
+
+                // Экранируем кавычки в сообщении коммита
+                const escapedMessage = commit.message.replace(/"/g, '\"');
+                // Коммитим, разрешая пустые коммиты (например, если были только удаления)
+                await runCommand(`git commit --allow-empty -m "${escapedMessage}"`, workspaceRoot);
             }
             vscode.window.showInformationMessage(`${commitsToApply.length} commits have been successfully applied.`);
 
@@ -242,6 +280,8 @@ async function downloadChanges(context) {
         // Очистка
         await fs.rm(tempDir, { recursive: true, force: true });
     }
+
+
 }
 
 
@@ -275,15 +315,19 @@ function createArchiveFromFolder(folderPath, outputPath) {
     });
 }
 
-async function copyRecursive(src, dest) {
+async function copyRecursive(src, dest, exclude = []) {
     const entries = await fs.readdir(src, { withFileTypes: true });
     for (let entry of entries) {
+        if (exclude.includes(entry.name)) {
+            continue;
+        }
         const srcPath = path.join(src, entry.name);
         const destPath = path.join(dest, entry.name);
         if (entry.isDirectory()) {
             await fs.mkdir(destPath, { recursive: true });
-            await copyRecursive(srcPath, destPath);
+            await copyRecursive(srcPath, destPath, exclude);
         } else {
+            await fs.mkdir(path.dirname(destPath), { recursive: true });
             await fs.copyFile(srcPath, destPath);
         }
     }
