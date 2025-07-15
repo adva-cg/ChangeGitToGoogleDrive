@@ -268,7 +268,14 @@ async function downloadChanges(context) {
                 // Коммитим, разрешая пустые коммиты (например, если были только удаления)
                 await runCommand(`git commit --allow-empty -m "${escapedMessage}"`, workspaceRoot);
             }
-            vscode.window.showInformationMessage(`${commitsToApply.length} commits have been successfully applied.`);
+			
+			if (commitsToApply.length > 0) {
+                const lastAppliedCommitHash = commitsToApply[commitsToApply.length - 1].hash;
+                await context.workspaceState.update(LAST_UPLOAD_HASH_KEY, lastAppliedCommitHash);
+                vscode.window.showInformationMessage(`${commitsToApply.length} commits have been successfully applied. Last commit hash updated to ${lastAppliedCommitHash.substring(0, 7)}.`);
+            } else {
+                vscode.window.showInformationMessage('No new commits were applied.');
+            }
 
         } else {
             // Полное восстановление
