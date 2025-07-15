@@ -147,10 +147,16 @@ async function incrementalUpload(context) {
 async function createAndUploadFullArchive(workspaceRoot, files) {
     const archiveName = `${path.basename(workspaceRoot)}_${moment().format('YYYYMMDDHHmmss')}.zip`;
     const archivePath = path.join(workspaceRoot, archiveName);
+    const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    statusBarItem.show();
 
     try {
         const output = fsSync.createWriteStream(archivePath);
         const archive = archiver('zip', { zlib: { level: 9 } });
+
+        const totalFiles = files.length;
+        let processedFiles = 0;
+        statusBarItem.text = `Archiving: 0/${totalFiles} files`;
 
         const closePromise = new Promise((resolve, reject) => {
             output.on('close', resolve);
@@ -164,6 +170,8 @@ async function createAndUploadFullArchive(workspaceRoot, files) {
             // Убедимся, что файл существует, прежде чем его добавлять
             if (fsSync.existsSync(filePath)) {
                 archive.file(filePath, { name: file });
+                processedFiles++;
+                statusBarItem.text = `Archiving: ${processedFiles}/${totalFiles} files`;
             } else {
                 vscode.window.showWarningMessage(`File not found and will be skipped: ${file}`);
             }
@@ -180,6 +188,9 @@ async function createAndUploadFullArchive(workspaceRoot, files) {
         if (fsSync.existsSync(archivePath)) {
             await fs.unlink(archivePath);
         }
+    } finally {
+        statusBarItem.hide();
+        statusBarItem.dispose();
     }
 }
 
@@ -264,7 +275,7 @@ async function downloadChanges(context) {
                 }
 
                 // Экранируем кавычки в сообщении коммита
-                const escapedMessage = commit.message.replace(/"/g, '\"');
+                const escapedMessage = commit.message.replace(/`/g, '`').replace(/"//g, '\"');
                 // Коммитим, разрешая пустые коммиты (например, если были только удаления)
                 await runCommand(`git commit --allow-empty -m "${escapedMessage}"`, workspaceRoot);
             }
@@ -309,17 +320,50 @@ function runCommand(command, cwd, options = {}) {
     });
 }
 
-function createArchiveFromFolder(folderPath, outputPath) {
-    return new Promise((resolve, reject) => {
+async function countFilesInDirectory(dir) {
+    let count = 0;
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+        if (entry.isDirectory()) {
+            count += await countFilesInDirectory(path.join(dir, entry.name));
+        } else {
+            count++;
+        }
+    }
+    return count;
+}
+
+async function createArchiveFromFolder(folderPath, outputPath) {
+    const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    statusBarItem.show();
+
+    try {
+        const totalFiles = await countFilesInDirectory(folderPath);
+        let processedFiles = 0;
+        statusBarItem.text = `Archiving: 0/${totalFiles} files`;
+
         const output = fsSync.createWriteStream(outputPath);
         const archive = archiver('zip', { zlib: { level: 9 } });
 
-        output.on('close', resolve);
-        archive.on('error', reject);
+        archive.on('entry', () => {
+            processedFiles++;
+            statusBarItem.text = `Archiving: ${processedFiles}/${totalFiles} files`;
+        });
+
+        const closePromise = new Promise((resolve, reject) => {
+            output.on('close', resolve);
+            archive.on('error', reject);
+        });
+
         archive.pipe(output);
         archive.directory(folderPath, false);
-        archive.finalize();
-    });
+        await archive.finalize();
+        await closePromise;
+
+    } finally {
+        statusBarItem.hide();
+        statusBarItem.dispose();
+    }
 }
 
 async function copyRecursive(src, dest, exclude = []) {
