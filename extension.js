@@ -11,12 +11,21 @@ const unzipper = require('unzipper');
 const LAST_UPLOAD_HASH_KEY = 'lastUploadCommitHash';
 
 function activate(context) {
-    // Команда выгрузки
-    let uploadDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.uploadChanges', async () => {
+    // Команда начальной выгрузки
+    let initialUploadDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.initialUpload', async () => {
         try {
-            await uploadChanges(context);
+            await initialUpload(context);
         } catch (error) {
-            vscode.window.showErrorMessage(`Upload failed: ${error.message}`);
+            vscode.window.showErrorMessage(`Initial upload failed: ${error.message}`);
+        }
+    });
+
+    // Команда инкрементальной выгрузки
+    let incrementalUploadDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.incrementalUpload', async () => {
+        try {
+            await incrementalUpload(context);
+        } catch (error) {
+            vscode.window.showErrorMessage(`Incremental upload failed: ${error.message}`);
         }
     });
 
@@ -29,11 +38,31 @@ function activate(context) {
         }
     });
 
-    context.subscriptions.push(uploadDisposable, downloadDisposable);
+    context.subscriptions.push(initialUploadDisposable, incrementalUploadDisposable, downloadDisposable);
 }
 
-// --- Подпрограмма: "Выгрузка изменений" ---
-async function uploadChanges(context) {
+// --- Подпрограмма: "Начальная выгрузка" ---
+async function initialUpload(context) {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders) {
+        vscode.window.showErrorMessage('No workspace folder is open.');
+        return;
+    }
+    const workspaceRoot = workspaceFolders[0].uri.fsPath;
+
+    const { stdout } = await runCommand('git -c core.quotepath=false ls-files', workspaceRoot);
+    if (!stdout) {
+        vscode.window.showInformationMessage('No files to upload in the repository.');
+        return;
+    }
+    const allFiles = stdout.trim().split('\n');
+    await createAndUploadFullArchive(workspaceRoot, allFiles);
+    const { stdout: headHash } = await runCommand('git rev-parse HEAD', workspaceRoot);
+    await context.workspaceState.update(LAST_UPLOAD_HASH_KEY, headHash.trim());
+}
+
+// --- Подпрограмма: "Инкрементальная выгрузка" ---
+async function incrementalUpload(context) {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders) {
         vscode.window.showErrorMessage('No workspace folder is open.');
@@ -42,31 +71,21 @@ async function uploadChanges(context) {
     const workspaceRoot = workspaceFolders[0].uri.fsPath;
 
     const lastUploadHash = context.workspaceState.get(LAST_UPLOAD_HASH_KEY);
-    let commits = [];
-
-    if (lastUploadHash) {
-        const command = `git log ${lastUploadHash}..HEAD --pretty=format:"%H %s"`;
-        const { stdout } = await runCommand(command, workspaceRoot);
-        if (!stdout) {
-            vscode.window.showInformationMessage('No new commits to upload.');
-            return;
-        }
-        commits = stdout.trim().split('\n').map(line => {
-            const [hash, ...message] = line.split(' ');
-            return { hash, message: message.join(' ') };
-        });
-    } else {
-        const { stdout } = await runCommand('git ls-files', workspaceRoot);
-        if (!stdout) {
-            vscode.window.showInformationMessage('No files to upload in the repository.');
-            return;
-        }
-        const allFiles = stdout.trim().split('\n');
-        await createAndUploadFullArchive(workspaceRoot, allFiles);
-        const { stdout: headHash } = await runCommand('git rev-parse HEAD', workspaceRoot);
-        await context.workspaceState.update(LAST_UPLOAD_HASH_KEY, headHash.trim());
+    if (!lastUploadHash) {
+        vscode.window.showErrorMessage('No previous upload found. Please run the initial upload first.');
         return;
     }
+
+    const command = `git -c core.quotepath=false log ${lastUploadHash}..HEAD --pretty=format:"%H %s"`;
+    const { stdout } = await runCommand(command, workspaceRoot);
+    if (!stdout) {
+        vscode.window.showInformationMessage('No new commits to upload.');
+        return;
+    }
+    const commits = stdout.trim().split('\n').map(line => {
+        const [hash, ...message] = line.split(' ');
+        return { hash, message: message.join(' ') };
+    });
 
     const tempDir = path.join(workspaceRoot, '.upload-temp');
     await fs.mkdir(tempDir, { recursive: true });
@@ -78,7 +97,7 @@ async function uploadChanges(context) {
         const commitDir = path.join(tempDir, commit.hash);
         await fs.mkdir(commitDir, { recursive: true });
 
-        const { stdout: files } = await runCommand(`git diff-tree --no-commit-id --name-only -r ${commit.hash}`, workspaceRoot);
+        const { stdout: files } = await runCommand(`git -c core.quotepath=false diff-tree --no-commit-id --name-only -r ${commit.hash}`, workspaceRoot);
         const changedFiles = files.trim().split('\n').filter(Boolean);
 
         for (const file of changedFiles) {
@@ -107,22 +126,40 @@ async function uploadChanges(context) {
 async function createAndUploadFullArchive(workspaceRoot, files) {
     const archiveName = `${path.basename(workspaceRoot)}_${moment().format('YYYYMMDDHHmmss')}.zip`;
     const archivePath = path.join(workspaceRoot, archiveName);
-    
-    await new Promise((resolve, reject) => {
+
+    try {
         const output = fsSync.createWriteStream(archivePath);
         const archive = archiver('zip', { zlib: { level: 9 } });
 
-        output.on('close', resolve);
-        archive.on('error', reject);
+        const closePromise = new Promise((resolve, reject) => {
+            output.on('close', resolve);
+            archive.on('error', reject);
+        });
+
         archive.pipe(output);
 
         for (const file of files) {
-            archive.file(path.join(workspaceRoot, file), { name: file });
+            const filePath = path.join(workspaceRoot, file);
+            // Убедимся, что файл существует, прежде чем его добавлять
+            if (fsSync.existsSync(filePath)) {
+                archive.file(filePath, { name: file });
+            } else {
+                vscode.window.showWarningMessage(`File not found and will be skipped: ${file}`);
+            }
         }
-        archive.finalize();
-    });
 
-    vscode.window.showInformationMessage(`Successfully created full archive at ${archivePath}. Now, upload it using the Google Drive extension.`);
+        await archive.finalize();
+        await closePromise;
+
+        vscode.window.showInformationMessage(`Successfully created full archive at ${archivePath}. Now, upload it using the Google Drive extension.`);
+
+    } catch (error) {
+        vscode.window.showErrorMessage(`Failed to create archive: ${error.message}`);
+        // Попытаемся удалить частично созданный архив в случае ошибки
+        if (fsSync.existsSync(archivePath)) {
+            await fs.unlink(archivePath);
+        }
+    }
 }
 
 
@@ -164,6 +201,7 @@ async function downloadChanges(context) {
         
         // Проверяем, есть ли commits.log для инкрементного обновления
         if (fsSync.existsSync(logPath)) {
+            vscode.window.showInformationMessage('Found commits.log, starting incremental download.');
             const logContent = await fs.readFile(logPath, 'utf-8');
             const commitsToApply = logContent.trim().split('\n').filter(Boolean).map(line => {
                 const [hash, ...message] = line.split(' ');
@@ -172,14 +210,25 @@ async function downloadChanges(context) {
 
             for (const commit of commitsToApply) {
                 const commitDir = path.join(tempDir, commit.hash);
+
                 // Копируем файлы из папки коммита в рабочую директорию
                 await copyRecursive(commitDir, workspaceRoot);
-                
-                // Коммитим изменения
-                await runCommand('git add .', workspaceRoot);
-                // Экранируем кавычки в сообщении коммита
-                const escapedMessage = commit.message.replace(/"/g, '\"');
-                await runCommand(`git commit -m "${escapedMessage}"`, workspaceRoot);
+
+                // Получаем список всех файлов, которые были в этом коммите
+                const filesToCommit = await getAllFilesRecursive(commitDir);
+
+                // Добавляем в индекс только эти файлы
+                if (filesToCommit.length > 0) {
+                    const filesToAdd = filesToCommit.map(f => `"${f.replace(/\//g, '/')}"`).join(' ');
+                    await runCommand(`git add -- ${filesToAdd}`, workspaceRoot);
+
+                    // Экранируем кавычки в сообщении коммита
+                    const escapedMessage = commit.message.replace(/"/g, '\"');
+                    await runCommand(`git commit -m "${escapedMessage}"`, workspaceRoot);
+                } else {
+                    // Если в коммите не было файлов (например, пустой коммит), можно его пропустить
+                    vscode.window.showInformationMessage(`Skipping empty commit: ${commit.hash}`);
+                }
             }
             vscode.window.showInformationMessage(`${commitsToApply.length} commits have been successfully applied.`);
 
@@ -200,7 +249,7 @@ async function downloadChanges(context) {
 
 function runCommand(command, cwd) {
     return new Promise((resolve, reject) => {
-        exec(command, { cwd }, (error, stdout, stderr) => {
+        exec(command, { encoding: 'utf8', cwd }, (error, stdout, stderr) => {
             if (error) {
                 console.error(`exec error: ${error}`);
                 return reject(error);
@@ -238,6 +287,24 @@ async function copyRecursive(src, dest) {
             await fs.copyFile(srcPath, destPath);
         }
     }
+}
+
+// Рекурсивно получает все пути к файлам в директории, возвращая относительные пути
+async function getAllFilesRecursive(baseDir) {
+    const result = [];
+    async function recurse(currentDir, relativePath) {
+        const entries = await fs.readdir(currentDir, { withFileTypes: true });
+        for (const entry of entries) {
+            const newRelativePath = path.join(relativePath, entry.name);
+            if (entry.isDirectory()) {
+                await recurse(path.join(currentDir, entry.name), newRelativePath);
+            } else {
+                result.push(newRelativePath);
+            }
+        }
+    }
+    await recurse(baseDir, '');
+    return result;
 }
 
 

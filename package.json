@@ -11,15 +11,17 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:changegittogoogledrive-extension.uploadChanges",
-    "onCommand:changegittogoogledrive-extension.downloadChanges"
   ],
   "main": "./extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "changegittogoogledrive-extension.uploadChanges",
-        "title": "Выгрузить изменения в Google Drive"
+        "command": "changegittogoogledrive-extension.initialUpload",
+        "title": "Начальная выгрузка в Google Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.incrementalUpload",
+        "title": "Инкрементальная выгрузка в Google Drive"
       },
       {
         "command": "changegittogoogledrive-extension.downloadChanges",
