@@ -76,15 +76,16 @@ async function incrementalUpload(context) {
         return;
     }
 
-    const command = `git -c core.quotepath=false log ${lastUploadHash}..HEAD --pretty=format:"%H %s"`;
+    const command = `git -c core.quotepath=false log ${lastUploadHash}..HEAD --pretty=format:"%H %aI %s" --reverse`;
     const { stdout } = await runCommand(command, workspaceRoot);
     if (!stdout) {
         vscode.window.showInformationMessage('No new commits to upload.');
         return;
     }
-    const commits = stdout.trim().split('\n').map(line => {
-        const [hash, ...message] = line.split(' ');
-        return { hash, message: message.join(' ') };
+    const commits = stdout.trim().split('\n').filter(Boolean).map(line => {
+        const [hash, date, ...messageParts] = line.split(' ');
+        const message = messageParts.join(' ');
+        return { hash, date, message };
     });
 
     const tempDir = path.join(workspaceRoot, '.upload-temp');
@@ -127,7 +128,7 @@ async function incrementalUpload(context) {
             const deletedFilePath = path.join(commitDir, 'deleted.txt');
             await fs.writeFile(deletedFilePath, deletedFiles.join('\n'));
         }
-        logContent += `${commit.hash} ${commit.message}\n`;
+        logContent += `${commit.hash} ${commit.date} ${commit.message}\n`;
     }
 
     await fs.writeFile(logFilePath, logContent);
@@ -236,8 +237,9 @@ async function downloadChanges(context) {
             vscode.window.showInformationMessage('Found commits.log, starting incremental download.');
             const logContent = await fs.readFile(logPath, 'utf-8');
             const commitsToApply = logContent.trim().split('\n').filter(Boolean).map(line => {
-                const [hash, ...message] = line.split(' ');
-                return { hash, message: message.join(' ') };
+                const [hash, date, ...messageParts] = line.split(' ');
+                const message = messageParts.join(' ');
+                return { hash, date, message };
             });
 
             for (const commit of commitsToApply) {
@@ -275,9 +277,9 @@ async function downloadChanges(context) {
                 }
 
                 // Экранируем кавычки в сообщении коммита
-                const escapedMessage = commit.message.replace(/`/g, '`').replace(/"//g, '\"');
+                const escapedMessage = commit.message.replace(/`/g, '`').replace(/"/g, '\"');
                 // Коммитим, разрешая пустые коммиты (например, если были только удаления)
-                await runCommand(`git commit --allow-empty -m "${escapedMessage}"`, workspaceRoot);
+                await runCommand(`git commit --allow-empty -m "${escapedMessage}" --date="${commit.date}"`, workspaceRoot);
             }
 			
 			if (commitsToApply.length > 0) {
