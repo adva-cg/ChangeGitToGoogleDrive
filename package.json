@@ -11,6 +11,9 @@
     "Other"
   ],
   "activationEvents": [
+    "onCommand:changegittogoogledrive-extension.initialUpload",
+    "onCommand:changegittogoogledrive-extension.incrementalUpload",
+    "onCommand:changegittogoogledrive-extension.downloadChanges"
   ],
   "main": "./extension.js",
   "contributes": {
