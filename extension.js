@@ -50,7 +50,7 @@ async function initialUpload(context) {
     }
     const workspaceRoot = workspaceFolders[0].uri.fsPath;
 
-    const { stdout } = await runCommand('git -c core.quotepath=false ls-files', workspaceRoot);
+    const { stdout } = await runCommand('git -c core.quotepath=false ls-files', workspaceRoot, { maxBuffer: 1024 * 1024 * 50 });
     if (!stdout) {
         vscode.window.showInformationMessage('No files to upload in the repository.');
         return;
@@ -247,9 +247,9 @@ async function downloadChanges(context) {
 
 // --- Вспомогательные функции ---
 
-function runCommand(command, cwd) {
+function runCommand(command, cwd, options = {}) {
     return new Promise((resolve, reject) => {
-        exec(command, { encoding: 'utf8', cwd }, (error, stdout, stderr) => {
+        exec(command, { encoding: 'utf8', cwd, ...options }, (error, stdout, stderr) => {
             if (error) {
                 console.error(`exec error: ${error}`);
                 return reject(error);
