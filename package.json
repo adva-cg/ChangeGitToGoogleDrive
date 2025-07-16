@@ -4,6 +4,10 @@
   "description": "An extension to archive and upload workspace files to Google Drive.",
   "version": "0.0.6",
   "publisher": "user",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/adva-cg/changegittogoogledrive-extension.git"
+  },
   "engines": {
     "vscode": "^1.83.0"
   },
