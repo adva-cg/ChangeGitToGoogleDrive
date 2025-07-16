@@ -376,7 +376,7 @@ async function downloadChanges(context) {
                 }
 
                 // Экранируем кавычки в сообщении коммита
-                const escapedMessage = commit.message.replace(/`/g, '`').replace(/"/g, '"');
+                const escapedMessage = commit.message.replace(/`/g, '`').replace(/"//g, '\"')
                 // Коммитим, разрешая пустые коммиты (например, если были только удаления)
                 await runCommand(`git commit --allow-empty -m "${escapedMessage}" --date="${commit.date}"`, workspaceRoot);
             }
