@@ -8,12 +8,12 @@ const { exec } = require('child_process');
 const unzipper = require('unzipper');
 const { google } = require('googleapis');
 const url = require('url');
+const http = require('http');
 
-const REDIRECT_URI = 'http://localhost:3000/oauth2callback';
+const REDIRECT_URI = 'http://localhost:8080/oauth2callback';
 
 // Ключи для хранения в SecretStorage и workspaceState
-const CLIENT_ID_KEY = 'googleDriveClientId';
-const CLIENT_SECRET_KEY = 'googleDriveClientSecret';
+const GOOGLE_DRIVE_CREDENTIALS_KEY = 'googleDriveCredentials';
 const GOOGLE_DRIVE_TOKENS_KEY = 'googleDriveTokens';
 const LAST_UPLOAD_HASH_KEY = 'lastUploadCommitHash';
 
@@ -68,44 +68,116 @@ function activate(context) {
 
 // --- Подпрограмма: "Установка учетных данных" ---
 async function setupGoogleCredentials(context) {
-    const clientId = await vscode.window.showInputBox({ prompt: 'Enter your Google Client ID' });
-    if (clientId) {
-        await context.secrets.store(CLIENT_ID_KEY, clientId);
-    }
+    const options = {
+        canSelectMany: false,
+        openLabel: 'Select client_secret.json',
+        filters: {
+            'JSON files': ['json']
+        }
+    };
 
-    const clientSecret = await vscode.window.showInputBox({ prompt: 'Enter your Google Client Secret' });
-    if (clientSecret) {
-        await context.secrets.store(CLIENT_SECRET_KEY, clientSecret);
-    }
+    const fileUri = await vscode.window.showOpenDialog(options);
 
-    vscode.window.showInformationMessage('Google credentials have been set up.');
+    if (fileUri && fileUri[0]) {
+        try {
+            const filePath = fileUri[0].fsPath;
+            const fileContent = await fs.readFile(filePath, 'utf8');
+            // Проверяем, что это действительно файл учетных данных
+            const credentials = JSON.parse(fileContent);
+            if (credentials.installed || credentials.web) {
+                await context.secrets.store(GOOGLE_DRIVE_CREDENTIALS_KEY, fileContent);
+                vscode.window.showInformationMessage('Google credentials have been set up successfully.');
+            } else {
+                vscode.window.showErrorMessage('Invalid credentials file. Please select the correct client_secret.json file.');
+            }
+        } catch (error) {
+            vscode.window.showErrorMessage(`Error reading or parsing credentials file: ${error.message}`);
+        }
+    } else {
+        vscode.window.showInformationMessage('Credential setup cancelled.');
+    }
 }
 
 // --- Подпрограмма: "Аутентификация" ---
 async function authenticateWithGoogle(context) {
-    const clientId = await context.secrets.get(CLIENT_ID_KEY);
-    const clientSecret = await context.secrets.get(CLIENT_SECRET_KEY);
+    try {
+        const credentialsStr = await context.secrets.get(GOOGLE_DRIVE_CREDENTIALS_KEY);
+        if (!credentialsStr) {
+            vscode.window.showErrorMessage('Google credentials are not set up. Please run the "Setup Google Credentials" command first.');
+            return;
+        }
 
-    if (!clientId || !clientSecret) {
-        vscode.window.showErrorMessage('Google credentials are not set up. Please run the "Setup Google Credentials" command first.');
-        return;
-    }
+        const credentials = JSON.parse(credentialsStr);
+        const credsType = credentials.web ? 'web' : 'installed';
+        const { client_id, client_secret, redirect_uris } = credentials[credsType];
+        const redirect_uri = redirect_uris[0];
 
-    const oauth2Client = new google.auth.OAuth2(clientId, clientSecret, REDIRECT_URI);
+        if (!redirect_uri.includes('localhost')) {
+            vscode.window.showErrorMessage('Only localhost redirect URIs are supported for this extension.');
+            return;
+        }
 
-    const authUrl = oauth2Client.generateAuthUrl({
-        access_type: 'offline',
-        scope: ['https://www.googleapis.com/auth/drive.file'],
-    });
+        const port = new url.URL(redirect_uri).port;
 
-    vscode.env.openExternal(vscode.Uri.parse(authUrl));
+        const oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uri);
 
-    const code = await vscode.window.showInputBox({ prompt: 'Enter the authorization code from the browser' });
+        return new Promise((resolve, reject) => {
+            const server = http.createServer(async (req, res) => {
+                const qs = new url.URL(req.url, `http://localhost:${port}`).searchParams;
+                const code = qs.get('code');
+                const error = qs.get('error');
 
-    if (code) {
-        const { tokens } = await oauth2Client.getToken(code);
-        await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(tokens));
-        vscode.window.showInformationMessage('Successfully authenticated with Google Drive!');
+                if (error) {
+                    res.writeHead(500);
+                    res.end(`Authentication failed: ${error}`);
+                    server.close();
+                    return reject(new Error(`Authentication error from Google: ${error}`));
+                }
+
+                if (!code) {
+                    res.writeHead(400);
+                    res.end('Authentication failed: Authorization code not found in callback.');
+                    server.close();
+                    return reject(new Error('Authorization code not found in callback.'));
+                }
+
+                try {
+                    const { tokens } = await oauth2Client.getToken(code);
+                    await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(tokens));
+                    
+                    const storedTokens = await context.secrets.get(GOOGLE_DRIVE_TOKENS_KEY);
+                    if (storedTokens) {
+                        vscode.window.showInformationMessage('Successfully authenticated with Google Drive and tokens are stored!');
+                        res.end('Authentication successful! You can close this browser tab.');
+                    } else {
+                        vscode.window.showErrorMessage('Authentication succeeded, but failed to store tokens. Please check your system keychain access.');
+                        res.writeHead(500);
+                        res.end('Authentication failed on server: Could not store tokens.');
+                    }
+                    resolve();
+                } catch (e) {
+                    vscode.window.showErrorMessage(`Failed to get or store tokens: ${e.message}`);
+                    res.writeHead(500);
+                    res.end('Authentication failed on server. Please check the extension logs.');
+                    reject(new Error(`Failed to get tokens: ${e.message}`));
+                } finally {
+                    server.close();
+                }
+            }).listen(port, () => {
+                const authUrl = oauth2Client.generateAuthUrl({
+                    access_type: 'offline',
+                    scope: ['https://www.googleapis.com/auth/drive.file'],
+                    prompt: 'consent'
+                });
+                vscode.env.openExternal(vscode.Uri.parse(authUrl));
+            });
+
+            server.on('error', (e) => {
+                reject(new Error(`Authentication server could not be started: ${e.message}`));
+            });
+        });
+    } catch (error) {
+        vscode.window.showErrorMessage(`Authentication failed: ${error.message}`);
     }
 }
 
@@ -376,7 +448,7 @@ async function downloadChanges(context) {
                 }
 
                 // Экранируем кавычки в сообщении коммита
-                const escapedMessage = commit.message.replace(/`/g, '`').replace(/"//g, '\"')
+                const escapedMessage = commit.message.replace(/`/g, '`').replace(/"\//g, '"')
                 // Коммитим, разрешая пустые коммиты (например, если были только удаления)
                 await runCommand(`git commit --allow-empty -m "${escapedMessage}" --date="${commit.date}"`, workspaceRoot);
             }
@@ -406,23 +478,38 @@ async function downloadChanges(context) {
 // --- Вспомогательные функции ---
 
 async function getAuthenticatedClient(context) {
-    const clientId = await context.secrets.get(CLIENT_ID_KEY);
-    const clientSecret = await context.secrets.get(CLIENT_SECRET_KEY);
-    const tokensStr = await context.secrets.get(GOOGLE_DRIVE_TOKENS_KEY);
+    const credentialsStr = await context.secrets.get(GOOGLE_DRIVE_CREDENTIALS_KEY);
+    if (!credentialsStr) {
+        return null;
+    }
 
-    if (!clientId || !clientSecret || !tokensStr) {
+    const credentials = JSON.parse(credentialsStr);
+    const credsType = credentials.web ? 'web' : 'installed';
+    const { client_id, client_secret, redirect_uris } = credentials[credsType];
+    const redirect_uri = redirect_uris[0];
+
+    const oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uri);
+
+    const tokensStr = await context.secrets.get(GOOGLE_DRIVE_TOKENS_KEY);
+    if (!tokensStr) {
         return null;
     }
 
     const tokens = JSON.parse(tokensStr);
-    const oauth2Client = new google.auth.OAuth2(clientId, clientSecret, REDIRECT_URI);
     oauth2Client.setCredentials(tokens);
 
     // Проверяем, не истек ли токен, и обновляем его при необходимости
     if (oauth2Client.isTokenExpiring()) {
-        const { credentials } = await oauth2Client.refreshAccessToken();
-        await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(credentials));
-        oauth2Client.setCredentials(credentials);
+        try {
+            const { credentials: newCredentials } = await oauth2Client.refreshAccessToken();
+            await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(newCredentials));
+            oauth2Client.setCredentials(newCredentials);
+        } catch (error) {
+            vscode.window.showErrorMessage(`Failed to refresh access token: ${error.message}`);
+            // Запускаем процесс аутентификации заново, если токен не удалось обновить
+            await authenticateWithGoogle(context);
+            return null; // Возвращаем null, так как аутентификация еще не завершена
+        }
     }
 
     return google.drive({ version: 'v3', auth: oauth2Client });
@@ -496,7 +583,7 @@ async function createArchiveFromFolder(folderPath, outputPath) {
     try {
         const totalFiles = await countFilesInDirectory(folderPath);
         let processedFiles = 0;
-        statusBarItem.text = `Archiving: 0/${totalFiles} files`;
+        statusBarItem.text = `Archiving: ${processedFiles}/${totalFiles} files`;
 
         const output = fsSync.createWriteStream(outputPath);
         const archive = archiver('zip', { zlib: { level: 9 } });
