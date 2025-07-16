@@ -11,6 +11,8 @@
     "Other"
   ],
   "activationEvents": [
+    "onCommand:changegittogoogledrive-extension.setupGoogleCredentials",
+    "onCommand:changegittogoogledrive-extension.authenticateWithGoogle",
     "onCommand:changegittogoogledrive-extension.initialUpload",
     "onCommand:changegittogoogledrive-extension.incrementalUpload",
     "onCommand:changegittogoogledrive-extension.downloadChanges"
@@ -20,15 +22,28 @@
     "commands": [
       {
         "command": "changegittogoogledrive-extension.initialUpload",
-        "title": "Начальная выгрузка в Google Drive"
+        "title": "Начальная выгрузка в Google Drive",
+        "category": "Git-To-Google-Drive"
       },
       {
         "command": "changegittogoogledrive-extension.incrementalUpload",
-        "title": "Инкрементальная выгрузка в Google Drive"
+        "title": "Инкрементальная выгрузка в Google Drive",
+        "category": "Git-To-Google-Drive"
       },
       {
         "command": "changegittogoogledrive-extension.downloadChanges",
-        "title": "Загрузить изменения из Google Drive"
+        "title": "Загрузить изменения из Google Drive",
+        "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.setupGoogleCredentials",
+        "title": "Установить учетные данные Google",
+        "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.authenticateWithGoogle",
+        "title": "Аутентификация с Google",
+        "category": "Git-To-Google-Drive"
       }
     ]
   },
