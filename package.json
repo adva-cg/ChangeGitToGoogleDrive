@@ -6,7 +6,7 @@
   "publisher": "user",
   "repository": {
     "type": "git",
-    "url": "https://github.com/adva-cg/changegittogoogledrive-extension.git"
+    "url": "https://github.com/adva-cg/ChangeGitToGoogleDrive.git"
   },
   "engines": {
     "vscode": "^1.83.0"
