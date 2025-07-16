@@ -323,6 +323,9 @@ async function createAndUploadFullArchive(workspaceRoot, files, currentBranch) {
             archive.append(`branch: ${currentBranch}`, { name: 'branch.info' });
         }
 
+        // Добавляем папку .git в архив
+        archive.directory(path.join(workspaceRoot, '.git'), '.git');
+
         for (const file of files) {
             const filePath = path.join(workspaceRoot, file);
             // Убедимся, что файл существует, прежде чем его добавлять
