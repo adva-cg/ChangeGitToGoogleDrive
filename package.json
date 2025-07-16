@@ -2,7 +2,7 @@
   "name": "changegittogoogledrive-extension",
   "displayName": "ChangeGitToGoogleDrive Extension",
   "description": "An extension to archive and upload workspace files to Google Drive.",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "publisher": "user",
   "engines": {
     "vscode": "^1.83.0"
@@ -32,18 +32,18 @@
       }
     ]
   },
-  
   "devDependencies": {
-    "@types/vscode": "^1.83.0",
     "@types/glob": "^8.1.0",
     "@types/mocha": "^10.0.2",
     "@types/node": "18.x",
+    "@types/vscode": "^1.83.0",
+    "@vscode/test-electron": "^2.3.4",
     "glob": "^8.1.0",
-    "mocha": "^10.2.0",
-    "@vscode/test-electron": "^2.3.4"
+    "mocha": "^10.2.0"
   },
   "dependencies": {
     "archiver": "^5.3.1",
+    "googleapis": "^153.0.0",
     "moment": "^2.29.4",
     "unzipper": "^0.10.11"
   }

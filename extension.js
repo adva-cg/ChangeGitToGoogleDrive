@@ -6,11 +6,36 @@ const archiver = require('archiver');
 const moment = require('moment');
 const { exec } = require('child_process');
 const unzipper = require('unzipper');
+const { google } = require('googleapis');
+const url = require('url');
 
-// Ключ для хранения хеша последнего выгруженного коммита
+const REDIRECT_URI = 'http://localhost:3000/oauth2callback';
+
+// Ключи для хранения в SecretStorage и workspaceState
+const CLIENT_ID_KEY = 'googleDriveClientId';
+const CLIENT_SECRET_KEY = 'googleDriveClientSecret';
+const GOOGLE_DRIVE_TOKENS_KEY = 'googleDriveTokens';
 const LAST_UPLOAD_HASH_KEY = 'lastUploadCommitHash';
 
 function activate(context) {
+    // Команда для установки учетных данных
+    let setupCredentialsDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.setupGoogleCredentials', async () => {
+        try {
+            await setupGoogleCredentials(context);
+        } catch (error) {
+            vscode.window.showErrorMessage(`Failed to set up Google credentials: ${error.message}`);
+        }
+    });
+
+    // Команда аутентификации
+    let authDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.authenticateWithGoogle', async () => {
+        try {
+            await authenticateWithGoogle(context);
+        } catch (error) {
+            vscode.window.showErrorMessage(`Authentication failed: ${error.message}`);
+        }
+    });
+
     // Команда начальной выгрузки
     let initialUploadDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.initialUpload', async () => {
         try {
@@ -38,7 +63,50 @@ function activate(context) {
         }
     });
 
-    context.subscriptions.push(initialUploadDisposable, incrementalUploadDisposable, downloadDisposable);
+    context.subscriptions.push(setupCredentialsDisposable, authDisposable, initialUploadDisposable, incrementalUploadDisposable, downloadDisposable);
+}
+
+// --- Подпрограмма: "Установка учетных данных" ---
+async function setupGoogleCredentials(context) {
+    const clientId = await vscode.window.showInputBox({ prompt: 'Enter your Google Client ID' });
+    if (clientId) {
+        await context.secrets.store(CLIENT_ID_KEY, clientId);
+    }
+
+    const clientSecret = await vscode.window.showInputBox({ prompt: 'Enter your Google Client Secret' });
+    if (clientSecret) {
+        await context.secrets.store(CLIENT_SECRET_KEY, clientSecret);
+    }
+
+    vscode.window.showInformationMessage('Google credentials have been set up.');
+}
+
+// --- Подпрограмма: "Аутентификация" ---
+async function authenticateWithGoogle(context) {
+    const clientId = await context.secrets.get(CLIENT_ID_KEY);
+    const clientSecret = await context.secrets.get(CLIENT_SECRET_KEY);
+
+    if (!clientId || !clientSecret) {
+        vscode.window.showErrorMessage('Google credentials are not set up. Please run the "Setup Google Credentials" command first.');
+        return;
+    }
+
+    const oauth2Client = new google.auth.OAuth2(clientId, clientSecret, REDIRECT_URI);
+
+    const authUrl = oauth2Client.generateAuthUrl({
+        access_type: 'offline',
+        scope: ['https://www.googleapis.com/auth/drive.file'],
+    });
+
+    vscode.env.openExternal(vscode.Uri.parse(authUrl));
+
+    const code = await vscode.window.showInputBox({ prompt: 'Enter the authorization code from the browser' });
+
+    if (code) {
+        const { tokens } = await oauth2Client.getToken(code);
+        await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(tokens));
+        vscode.window.showInformationMessage('Successfully authenticated with Google Drive!');
+    }
 }
 
 // --- Подпрограмма: "Начальная выгрузка" ---
@@ -56,9 +124,12 @@ async function initialUpload(context) {
         return;
     }
     const allFiles = stdout.trim().split('\n');
-    await createAndUploadFullArchive(workspaceRoot, allFiles);
-    const { stdout: headHash } = await runCommand('git rev-parse HEAD', workspaceRoot);
-    await context.workspaceState.update(LAST_UPLOAD_HASH_KEY, headHash.trim());
+    const archivePath = await createAndUploadFullArchive(workspaceRoot, allFiles);
+    if (archivePath) {
+        await uploadToGoogleDrive(context, archivePath);
+        const { stdout: headHash } = await runCommand('git rev-parse HEAD', workspaceRoot);
+        await context.workspaceState.update(LAST_UPLOAD_HASH_KEY, headHash.trim());
+    }
 }
 
 // --- Подпрограмма: "Инкрементальная выгрузка" ---
@@ -137,12 +208,13 @@ async function incrementalUpload(context) {
     const archivePath = path.join(workspaceRoot, archiveName);
 
     await createArchiveFromFolder(tempDir, archivePath);
+    await uploadToGoogleDrive(context, archivePath);
 
     const { stdout: newHeadHash } = await runCommand('git rev-parse HEAD', workspaceRoot);
     await context.workspaceState.update(LAST_UPLOAD_HASH_KEY, newHeadHash.trim());
     await fs.rm(tempDir, { recursive: true, force: true });
 
-    vscode.window.showInformationMessage(`Successfully created incremental archive at ${archivePath}. Now, upload it using the Google Drive extension.`);
+    vscode.window.showInformationMessage(`Successfully created and uploaded incremental archive.`);
 }
 
 async function createAndUploadFullArchive(workspaceRoot, files) {
@@ -181,7 +253,7 @@ async function createAndUploadFullArchive(workspaceRoot, files) {
         await archive.finalize();
         await closePromise;
 
-        vscode.window.showInformationMessage(`Successfully created full archive at ${archivePath}. Now, upload it using the Google Drive extension.`);
+        return archivePath;
 
     } catch (error) {
         vscode.window.showErrorMessage(`Failed to create archive: ${error.message}`);
@@ -189,6 +261,7 @@ async function createAndUploadFullArchive(workspaceRoot, files) {
         if (fsSync.existsSync(archivePath)) {
             await fs.unlink(archivePath);
         }
+        return null;
     } finally {
         statusBarItem.hide();
         statusBarItem.dispose();
@@ -205,17 +278,43 @@ async function downloadChanges(context) {
     }
     const workspaceRoot = workspaceFolders[0].uri.fsPath;
 
-    const archiveUri = await vscode.window.showOpenDialog({
-        canSelectMany: false,
-        openLabel: 'Select Archive to Download',
-        filters: { 'Zip archives': ['zip'] }
-    });
-
-    if (!archiveUri || archiveUri.length === 0) {
-        vscode.window.showInformationMessage('No archive selected.');
+    const drive = await getAuthenticatedClient(context);
+    if (!drive) {
+        vscode.window.showErrorMessage('Authentication with Google Drive is required.');
         return;
     }
-    const archivePath = archiveUri[0].fsPath;
+
+    const { data } = await drive.files.list({
+        q: "mimeType='application/zip' and trashed = false",
+        fields: 'files(id, name)',
+        orderBy: 'createdTime desc'
+    });
+
+    const files = data.files;
+    if (files.length === 0) {
+        vscode.window.showInformationMessage('No archives found on Google Drive.');
+        return;
+    }
+
+    const selectedFile = await vscode.window.showQuickPick(files.map(f => ({ label: f.name, description: f.id })), {
+        placeHolder: 'Select an archive to download'
+    });
+
+    if (!selectedFile) {
+        return;
+    }
+
+    const fileId = selectedFile.description;
+    const archivePath = path.join(workspaceRoot, selectedFile.label);
+
+    const dest = fsSync.createWriteStream(archivePath);
+    const { data: fileStream } = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+
+    await new Promise((resolve, reject) => {
+        fileStream.on('end', resolve);
+        fileStream.on('error', reject);
+        fileStream.pipe(dest);
+    });
 
     const { stdout: status } = await runCommand('git status --porcelain', workspaceRoot);
     if (status.trim()) {
@@ -277,7 +376,7 @@ async function downloadChanges(context) {
                 }
 
                 // Экранируем кавычки в сообщении коммита
-                const escapedMessage = commit.message.replace(/`/g, '`').replace(/"/g, '\"');
+                const escapedMessage = commit.message.replace(/`/g, '`').replace(/"/g, '"');
                 // Коммитим, разрешая пустые коммиты (например, если были только удаления)
                 await runCommand(`git commit --allow-empty -m "${escapedMessage}" --date="${commit.date}"`, workspaceRoot);
             }
@@ -299,13 +398,68 @@ async function downloadChanges(context) {
     } finally {
         // Очистка
         await fs.rm(tempDir, { recursive: true, force: true });
+        await fs.unlink(archivePath);
     }
-
-
 }
 
 
 // --- Вспомогательные функции ---
+
+async function getAuthenticatedClient(context) {
+    const clientId = await context.secrets.get(CLIENT_ID_KEY);
+    const clientSecret = await context.secrets.get(CLIENT_SECRET_KEY);
+    const tokensStr = await context.secrets.get(GOOGLE_DRIVE_TOKENS_KEY);
+
+    if (!clientId || !clientSecret || !tokensStr) {
+        return null;
+    }
+
+    const tokens = JSON.parse(tokensStr);
+    const oauth2Client = new google.auth.OAuth2(clientId, clientSecret, REDIRECT_URI);
+    oauth2Client.setCredentials(tokens);
+
+    // Проверяем, не истек ли токен, и обновляем его при необходимости
+    if (oauth2Client.isTokenExpiring()) {
+        const { credentials } = await oauth2Client.refreshAccessToken();
+        await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(credentials));
+        oauth2Client.setCredentials(credentials);
+    }
+
+    return google.drive({ version: 'v3', auth: oauth2Client });
+}
+
+async function uploadToGoogleDrive(context, archivePath) {
+    const drive = await getAuthenticatedClient(context);
+    if (!drive) {
+        vscode.window.showErrorMessage('Authentication with Google Drive is required.');
+        return;
+    }
+
+    const archiveName = path.basename(archivePath);
+
+    const media = {
+        mimeType: 'application/zip',
+        body: fsSync.createReadStream(archivePath),
+    };
+
+    const fileMetadata = {
+        name: archiveName,
+    };
+
+    try {
+        const file = await drive.files.create({
+            resource: fileMetadata,
+            media: media,
+            fields: 'id',
+        });
+        vscode.window.showInformationMessage(`Successfully uploaded archive to Google Drive with ID: ${file.data.id}`);
+    } catch (error) {
+        vscode.window.showErrorMessage(`Google Drive upload failed: ${error.message}`);
+    } finally {
+        // Удаляем локальный архив после выгрузки
+        await fs.unlink(archivePath);
+    }
+}
 
 function runCommand(command, cwd, options = {}) {
     return new Promise((resolve, reject) => {
