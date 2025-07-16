@@ -15,7 +15,7 @@ const REDIRECT_URI = 'http://localhost:8080/oauth2callback';
 // Ключи для хранения в SecretStorage и workspaceState
 const GOOGLE_DRIVE_CREDENTIALS_KEY = 'googleDriveCredentials';
 const GOOGLE_DRIVE_TOKENS_KEY = 'googleDriveTokens';
-const LAST_UPLOAD_HASH_KEY = 'lastUploadCommitHash';
+const LAST_UPLOAD_HASHES_BY_BRANCH_KEY = 'lastUploadHashesByBranch';
 
 function activate(context) {
     // Команда для установки учетных данных
@@ -189,6 +189,7 @@ async function initialUpload(context) {
         return;
     }
     const workspaceRoot = workspaceFolders[0].uri.fsPath;
+    const currentBranch = await getCurrentBranch(workspaceRoot);
 
     const { stdout } = await runCommand('git -c core.quotepath=false ls-files', workspaceRoot, { maxBuffer: 1024 * 1024 * 50 });
     if (!stdout) {
@@ -196,11 +197,14 @@ async function initialUpload(context) {
         return;
     }
     const allFiles = stdout.trim().split('\n');
-    const archivePath = await createAndUploadFullArchive(workspaceRoot, allFiles);
+    const archivePath = await createAndUploadFullArchive(workspaceRoot, allFiles, currentBranch);
     if (archivePath) {
         await uploadToGoogleDrive(context, archivePath);
         const { stdout: headHash } = await runCommand('git rev-parse HEAD', workspaceRoot);
-        await context.workspaceState.update(LAST_UPLOAD_HASH_KEY, headHash.trim());
+        const hashes = context.workspaceState.get(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, {});
+        hashes[currentBranch] = headHash.trim();
+        await context.workspaceState.update(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, hashes);
+        vscode.window.showInformationMessage(`Initial upload for branch '${currentBranch}' successful.`);
     }
 }
 
@@ -212,10 +216,13 @@ async function incrementalUpload(context) {
         return;
     }
     const workspaceRoot = workspaceFolders[0].uri.fsPath;
+    const currentBranch = await getCurrentBranch(workspaceRoot);
 
-    const lastUploadHash = context.workspaceState.get(LAST_UPLOAD_HASH_KEY);
+    const allHashes = context.workspaceState.get(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, {});
+    const lastUploadHash = allHashes[currentBranch];
+
     if (!lastUploadHash) {
-        vscode.window.showErrorMessage('No previous upload found. Please run the initial upload first.');
+        vscode.window.showErrorMessage(`No previous upload found for branch '${currentBranch}'. Please run the initial upload first.`);
         return;
     }
 
@@ -235,7 +242,7 @@ async function incrementalUpload(context) {
     await fs.mkdir(tempDir, { recursive: true });
 
     const logFilePath = path.join(tempDir, 'commits.log');
-    let logContent = '';
+    let logContent = `branch: ${currentBranch}\n`;
 
     for (const commit of commits) {
         const commitDir = path.join(tempDir, commit.hash);
@@ -283,13 +290,14 @@ async function incrementalUpload(context) {
     await uploadToGoogleDrive(context, archivePath);
 
     const { stdout: newHeadHash } = await runCommand('git rev-parse HEAD', workspaceRoot);
-    await context.workspaceState.update(LAST_UPLOAD_HASH_KEY, newHeadHash.trim());
+    allHashes[currentBranch] = newHeadHash.trim();
+    await context.workspaceState.update(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, allHashes);
     await fs.rm(tempDir, { recursive: true, force: true });
 
-    vscode.window.showInformationMessage(`Successfully created and uploaded incremental archive.`);
+    vscode.window.showInformationMessage(`Successfully created and uploaded incremental archive for branch '${currentBranch}'.`);
 }
 
-async function createAndUploadFullArchive(workspaceRoot, files) {
+async function createAndUploadFullArchive(workspaceRoot, files, currentBranch) {
     const archiveName = `${path.basename(workspaceRoot)}_${moment().format('YYYYMMDDHHmmss')}.zip`;
     const archivePath = path.join(workspaceRoot, archiveName);
     const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
@@ -309,6 +317,11 @@ async function createAndUploadFullArchive(workspaceRoot, files) {
         });
 
         archive.pipe(output);
+
+        // Добавляем информацию о ветке в архив
+        if (currentBranch) {
+            archive.append(`branch: ${currentBranch}`, { name: 'branch.info' });
+        }
 
         for (const file of files) {
             const filePath = path.join(workspaceRoot, file);
@@ -349,6 +362,7 @@ async function downloadChanges(context) {
         return;
     }
     const workspaceRoot = workspaceFolders[0].uri.fsPath;
+    const currentBranch = await getCurrentBranch(workspaceRoot);
 
     const drive = await getAuthenticatedClient(context);
     if (!drive) {
@@ -407,7 +421,16 @@ async function downloadChanges(context) {
         if (fsSync.existsSync(logPath)) {
             vscode.window.showInformationMessage('Found commits.log, starting incremental download.');
             const logContent = await fs.readFile(logPath, 'utf-8');
-            const commitsToApply = logContent.trim().split('\n').filter(Boolean).map(line => {
+            const logLines = logContent.trim().split('\n');
+            const branchLine = logLines.find(line => line.startsWith('branch:'));
+            const archiveBranch = branchLine ? branchLine.split(':')[1].trim() : null;
+
+            if (archiveBranch && archiveBranch !== currentBranch) {
+                vscode.window.showErrorMessage(`Archive is for branch '${archiveBranch}' but you are on branch '${currentBranch}'. Please switch branches and try again.`);
+                return;
+            }
+
+            const commitsToApply = logLines.filter(line => !line.startsWith('branch:')).map(line => {
                 const [hash, date, ...messageParts] = line.split(' ');
                 const message = messageParts.join(' ');
                 return { hash, date, message };
@@ -424,7 +447,7 @@ async function downloadChanges(context) {
                         const filesToRemove = [];
                         for (const file of deletedFiles) {
                             if (fsSync.existsSync(path.join(workspaceRoot, file))) {
-                                filesToRemove.push(`"${file.replace(/\\//g, '/')}"`);
+                                filesToRemove.push(`"${file.replace(/\\/g, '/')}"`);
                             } else {
                                 vscode.window.showWarningMessage(`File scheduled for deletion not found, skipping: ${file}`);
                             }
@@ -443,20 +466,22 @@ async function downloadChanges(context) {
 
                 // Добавляем в индекс только измененные/новые файлы
                 if (filesToCommit.length > 0) {
-                    const filesToAdd = filesToCommit.map(f => `"${f.replace(/\\//g, '/')}"`).join(' ');
+                    const filesToAdd = filesToCommit.map(f => `"${f.replace(/\\/g, '/')}"`).join(' ');
                     await runCommand(`git add -- ${filesToAdd}`, workspaceRoot);
                 }
 
                 // Экранируем кавычки в сообщении коммита
-                const escapedMessage = commit.message.replace(/`/g, '`').replace(/"\//g, '"')
-                // Коммитим, разрешая пустые коммиты (например, если были только удаления)
+                const escapedMessage = commit.message.replace(/`/g, '\`').replace(/"/g, '\"');
+                //const escapedMessage = commit.message;
                 await runCommand(`git commit --allow-empty -m "${escapedMessage}" --date="${commit.date}"`, workspaceRoot);
             }
 			
 			if (commitsToApply.length > 0) {
                 const lastAppliedCommitHash = commitsToApply[commitsToApply.length - 1].hash;
-                await context.workspaceState.update(LAST_UPLOAD_HASH_KEY, lastAppliedCommitHash);
-                vscode.window.showInformationMessage(`${commitsToApply.length} commits have been successfully applied. Last commit hash updated to ${lastAppliedCommitHash.substring(0, 7)}.`);
+                const allHashes = context.workspaceState.get(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, {});
+                allHashes[currentBranch] = lastAppliedCommitHash;
+                await context.workspaceState.update(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, allHashes);
+                vscode.window.showInformationMessage(`${commitsToApply.length} commits have been successfully applied to branch '${currentBranch}'.`);
             } else {
                 vscode.window.showInformationMessage('No new commits were applied.');
             }
@@ -643,6 +668,16 @@ async function getAllFilesRecursive(baseDir) {
     }
     await recurse(baseDir, '');
     return result;
+}
+
+async function getCurrentBranch(cwd) {
+    try {
+        const { stdout } = await runCommand('git rev-parse --abbrev-ref HEAD', cwd);
+        return stdout.trim();
+    } catch (error) {
+        vscode.window.showErrorMessage('Could not determine the current git branch.');
+        throw new Error('Failed to get current branch');
+    }
 }
 
 
