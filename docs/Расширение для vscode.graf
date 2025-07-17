@@ -1,0 +1,54 @@
+{
+  "type": "graf",
+  "items": {
+    "1": {
+      "type": "ridea",
+      "content": "Пользовательские команды",
+      "parent": "root",
+      "treeType": "treeview",
+      "ordinal": 1
+    },
+    "2": {
+      "type": "idea",
+      "content": "Внести учетные данные Google",
+      "parent": "1",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "3": {
+      "type": "idea",
+      "content": "Авторизация google",
+      "parent": "1",
+      "treeType": "treeview",
+      "ordinal": 1
+    },
+    "4": {
+      "type": "conclusion",
+      "content": "Создает токен",
+      "parent": "3",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "5": {
+      "type": "conclusion",
+      "content": "Вносится файл json сгенерированный на ...\n\nВ файле надо добавить порт перенаправления",
+      "parent": "2",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "7": {
+      "type": "ridea",
+      "content": "Предназначение",
+      "parent": "root",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "8": {
+      "type": "conclusion",
+      "content": "Для использования google drive в качестве \"удаленного репозитария git\"",
+      "parent": "7",
+      "treeType": "treeview",
+      "ordinal": 0
+    }
+  }
+}
