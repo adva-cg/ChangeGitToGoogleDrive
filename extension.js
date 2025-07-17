@@ -19,7 +19,7 @@ function activate(context) {
     context.subscriptions.push(
         vscode.commands.registerCommand('changegittogoogledrive-extension.setupGoogleCredentials', () => setupGoogleCredentials(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.authenticateWithGoogle', () => authenticateWithGoogle(context)),
-        vscode.commands.registerCommand('changegittogoogledrive-extension.initialUpload', () => pushCommits(context)), // initialUpload это просто первый push
+        vscode.commands.registerCommand('changegittogoogledrive-extension.initialUpload', () => initialUpload(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.sync', () => sync(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.installGitHooks', () => installGitHooks(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.cloneFromGoogleDrive', () => cloneFromGoogleDrive(context))
@@ -41,6 +41,25 @@ function activate(context) {
 }
 
 // --- ОСНОВНЫЕ КОМАНДЫ ---
+
+async function initialUpload(context) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
+
+    try {
+        const currentBranch = await getCurrentBranch(workspaceRoot);
+        if (!currentBranch) return;
+
+        // Сбрасываем хэш для текущей ветки
+        await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`, undefined);
+        vscode.window.showInformationMessage(`Статус синхронизации для ветки '${currentBranch}' сброшен. Начинаю новую выгрузку...`);
+
+        // Теперь вызываем существующую функцию push
+        await pushCommits(context);
+    } catch (error) {
+        vscode.window.showErrorMessage(`Первоначальная выгрузка не удалась: ${error.message}`);
+    }
+}
 
 async function sync(context) {
     vscode.window.showInformationMessage('Syncing with Google Drive...');
