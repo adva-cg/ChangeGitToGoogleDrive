@@ -314,6 +314,15 @@ async function cloneFromGoogleDrive(context) {
 
         await fs.rm(tempDir, { recursive: true, force: true });
 
+        // После клонирования нам нужно установить начальный хэш, чтобы предотвратить повторное объединение всего репозитория.
+        const clonedHead = selectedBundle.label.replace('.bundle', '');
+        const currentBranch = await getCurrentBranch(workspaceRoot);
+        if (currentBranch) {
+            await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`, clonedHead);
+            vscode.window.showInformationMessage(`Set initial hash for branch '${currentBranch}' to ${clonedHead.substring(0, 7)}.`);
+        }
+
+
         vscode.window.showInformationMessage('Repository cloned successfully! Reloading window...');
 
         // Перезагружаем окно, чтобы VS Code подхватил новый репозиторий
