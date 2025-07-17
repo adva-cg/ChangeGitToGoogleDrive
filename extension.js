@@ -109,7 +109,7 @@ async function pushCommits(context) {
         return;
     }
 
-    const bundleFileName = `${currentHead}.bundle`;
+    const bundleFileName = `${currentBranch}--${currentHead}.bundle`;
     const bundlePath = path.join(workspaceRoot, '.git', bundleFileName);
 
     try {
@@ -141,9 +141,14 @@ async function pullCommits(context) {
     const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
     if (!bundleFolderId) return;
 
-    // 1. Получаем список всех бандлов с Google Drive
+    const currentBranch = await getCurrentBranch(workspaceRoot);
+    if (!currentBranch) {
+        vscode.window.showInformationMessage('Not on a branch, skipping pull.');
+        return;
+    }
+
     const { data: { files: remoteBundles } } = await drive.files.list({
-        q: `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle'`,
+        q: `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle' and name contains '${currentBranch}--'`,
         fields: 'files(id, name, createdTime)',
         orderBy: 'createdTime',
     });
@@ -153,12 +158,13 @@ async function pullCommits(context) {
         return;
     }
 
-    // 2. Получаем список всех коммитов, которые есть локально
     const { stdout: localCommitsResult } = await runCommand('git rev-list --all --pretty=format:%H', workspaceRoot);
     const localCommitSet = new Set(localCommitsResult.trim().split(/\s+/));
 
-    // 3. Определяем, какие бандлы нужно скачать
-    const bundlesToDownload = remoteBundles.filter(bundle => !localCommitSet.has(bundle.name.replace('.bundle', '')));
+    const bundlesToDownload = remoteBundles.filter(bundle => {
+        const commitHash = bundle.name.split('--')[1]?.replace('.bundle', '');
+        return commitHash && !localCommitSet.has(commitHash);
+    });
 
     if (bundlesToDownload.length === 0) {
         vscode.window.showInformationMessage('Local repository is up-to-date.');
@@ -169,6 +175,7 @@ async function pullCommits(context) {
 
     const tempDir = path.join(workspaceRoot, '.git', 'gdrive-temp-bundles');
     await fs.mkdir(tempDir, { recursive: true });
+    let fetchedSomething = false;
 
     try {
         for (const bundle of bundlesToDownload) {
@@ -179,12 +186,19 @@ async function pullCommits(context) {
                 fileStream.pipe(dest).on('finish', resolve).on('error', reject);
             });
 
-            // 4. Применяем бандл через fetch. Это безопасно и не меняет рабочую копию.
             await runCommand(`git fetch "${tempBundlePath}"`, workspaceRoot);
-            vscode.window.showInformationMessage(`Fetched commit ${bundle.name.substring(0, 7)}.`);
+            fetchedSomething = true;
+            vscode.window.showInformationMessage(`Fetched commit ${bundle.name.split('--')[1]?.substring(0, 7)}.`);
         }
 
-        vscode.window.showInformationMessage('All new commits have been fetched. Please merge or rebase your branch as needed.');
+        if (fetchedSomething) {
+            try {
+                await runCommand(`git merge --ff-only FETCH_HEAD`, workspaceRoot);
+                vscode.window.showInformationMessage('Successfully merged remote changes.');
+            } catch (error) {
+                vscode.window.showInformationMessage('New commits have been fetched. Please merge or rebase your branch as needed.');
+            }
+        }
 
     } catch (error) {
         vscode.window.showErrorMessage(`Pull failed: ${error.message}`);
@@ -326,12 +340,8 @@ async function cloneFromGoogleDrive(context) {
         const cloneTempDir = path.join(tempDir, 'cloned');
         await runCommand(`git clone "${tempBundlePath}" "${cloneTempDir}"`, tempDir);
 
-        // Determine the branch to checkout from the bundle
-        const { stdout: bundleHeads } = await runCommand(`git bundle list-heads "${tempBundlePath}"`, tempDir);
-        // We need to handle both / and \ as path separators
-        const mainBranchMatch = bundleHeads.match(/refs[\\\/]heads[\\\/](.+)/);
-        const branchToCheckout = mainBranchMatch ? mainBranchMatch[1].trim() : null;
-
+        // Determine the branch to checkout from the bundle name
+        const [branchToCheckout, clonedHead] = selectedBundle.label.replace('.bundle', '').split('--');
 
         // Перемещаем все из cloneTempDir в workspaceRoot
         const clonedFiles = await fs.readdir(cloneTempDir);
@@ -344,21 +354,18 @@ async function cloneFromGoogleDrive(context) {
         // Checkout the branch if we found one
         if (branchToCheckout) {
             try {
-                await runCommand(`git checkout ${branchToCheckout}`, workspaceRoot);
+                await runCommand(`git checkout -b ${branchToCheckout}`, workspaceRoot);
                 vscode.window.showInformationMessage(`Switched to branch '${branchToCheckout}'.`);
+
+                // После успешного переключения ветки, устанавливаем хэш
+                await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${branchToCheckout}`, clonedHead);
+                vscode.window.showInformationMessage(`Set initial hash for branch '${branchToCheckout}' to ${clonedHead.substring(0, 7)}.`);
+
             } catch (error) {
-                vscode.window.showWarningMessage(`Could not checkout branch '${branchToCheckout}'. Please do it manually.`);
+                vscode.window.showWarningMessage(`Could not create and checkout branch '${branchToCheckout}'. Please do it manually.`);
             }
         } else {
-            vscode.window.showWarningMessage(`Could not automatically determine the main branch. Please checkout a branch manually.`);
-        }
-
-        // После клонирования нам нужно установить начальный хэш, чтобы предотвратить повторное объединение всего репозитория.
-        const clonedHead = selectedBundle.label.replace('.bundle', '');
-        const currentBranch = await getCurrentBranch(workspaceRoot);
-        if (currentBranch) {
-            await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`, clonedHead);
-            vscode.window.showInformationMessage(`Set initial hash for branch '${currentBranch}' to ${clonedHead.substring(0, 7)}.`);
+            vscode.window.showWarningMessage(`Could not automatically determine the main branch from bundle name. Please checkout a branch manually.`);
         }
 
 
