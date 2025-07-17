@@ -21,7 +21,8 @@ function activate(context) {
         vscode.commands.registerCommand('changegittogoogledrive-extension.authenticateWithGoogle', () => authenticateWithGoogle(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.initialUpload', () => pushCommits(context)), // initialUpload это просто первый push
         vscode.commands.registerCommand('changegittogoogledrive-extension.sync', () => sync(context)),
-        vscode.commands.registerCommand('changegittogoogledrive-extension.installGitHooks', () => installGitHooks(context))
+        vscode.commands.registerCommand('changegittogoogledrive-extension.installGitHooks', () => installGitHooks(context)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.cloneFromGoogleDrive', () => cloneFromGoogleDrive(context))
     );
 
     // --- РЕГИСТРАЦИЯ ОБРАБОТЧИКА URI ДЛЯ GIT HOOKS ---
@@ -216,6 +217,117 @@ fi
     }
 }
 
+async function cloneFromGoogleDrive(context) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return; // No folder open
+
+    // 1. Проверяем, что рабочая папка пуста
+    const files = await fs.readdir(workspaceRoot);
+    if (files.length > 0) {
+        vscode.window.showErrorMessage('Clone can only be done into an empty folder.');
+        return;
+    }
+
+    const drive = await getAuthenticatedClient(context);
+    if (!drive) return;
+
+    try {
+        // 2. Находим корневую папку .gdrive-git
+        const { data: { files: rootFolders } } = await drive.files.list({
+            q: `name='.gdrive-git' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+            fields: 'files(id, name)'
+        });
+        if (rootFolders.length === 0) {
+            vscode.window.showErrorMessage('No projects found on Google Drive. Please perform an initial upload from a source repository first.');
+            return;
+        }
+        const rootFolderId = rootFolders[0].id;
+
+        // 3. Получаем список папок проектов внутри .gdrive-git
+        const { data: { files: projectFolders } } = await drive.files.list({
+            q: `mimeType='application/vnd.google-apps.folder' and '${rootFolderId}' in parents and trashed=false`,
+            fields: 'files(id, name)'
+        });
+        if (projectFolders.length === 0) {
+            vscode.window.showErrorMessage('No projects found in the .gdrive-git folder.');
+            return;
+        }
+
+        // 4. Даем пользователю выбрать проект
+        const selectedProject = await vscode.window.showQuickPick(
+            projectFolders.map(f => ({ label: f.name, description: `(ID: ${f.id})`, id: f.id })),
+            { placeHolder: 'Select the project to clone' }
+        );
+        if (!selectedProject) return; // User cancelled
+
+        // 5. Находим папку bundles для выбранного проекта
+        const { data: { files: bundlesFolders } } = await drive.files.list({
+            q: `name='bundles' and mimeType='application/vnd.google-apps.folder' and '${selectedProject.id}' in parents and trashed=false`,
+            fields: 'files(id)'
+        });
+        if (bundlesFolders.length === 0) {
+            vscode.window.showErrorMessage(`No 'bundles' folder found for project ${selectedProject.label}.`);
+            return;
+        }
+        const bundleFolderId = bundlesFolders[0].id;
+
+        // 6. Получаем список всех бандлов для этого проекта
+        const { data: { files: remoteBundles } } = await drive.files.list({
+            q: `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle'`,
+            fields: 'files(id, name)',
+            orderBy: 'createdTime desc' // Сортируем, чтобы самый новый был первым
+        });
+        if (!remoteBundles || remoteBundles.length === 0) {
+            vscode.window.showErrorMessage('No bundles found to clone from.');
+            return;
+        }
+
+        // 7. Даем пользователю выбрать бандл (предлагаем самый новый по умолчанию)
+        const selectedBundle = await vscode.window.showQuickPick(
+            remoteBundles.map(b => ({ label: b.name, description: `(ID: ${b.id})`, id: b.id })),
+            { placeHolder: 'Select the bundle to clone from (latest is recommended)' }
+        );
+        if (!selectedBundle) return; // User cancelled
+
+        // 8. Скачиваем и клонируем
+        const tempDir = path.join(workspaceRoot, '.gdrive-temp-clone');
+        await fs.mkdir(tempDir, { recursive: true });
+        const tempBundlePath = path.join(tempDir, selectedBundle.label);
+
+        vscode.window.showInformationMessage(`Downloading ${selectedBundle.label}...`);
+        const dest = fsSync.createWriteStream(tempBundlePath);
+        const { data: fileStream } = await drive.files.get({ fileId: selectedBundle.id, alt: 'media' }, { responseType: 'stream' });
+        await new Promise((resolve, reject) => {
+            fileStream.pipe(dest).on('finish', resolve).on('error', reject);
+        });
+
+        vscode.window.showInformationMessage(`Cloning repository from ${selectedBundle.label}...`);
+        // Клонируем во временную папку, затем перемещаем содержимое
+        const cloneTempDir = path.join(tempDir, 'cloned');
+        await runCommand(`git clone "${tempBundlePath}" "${cloneTempDir}"`, tempDir);
+
+        // Перемещаем все из cloneTempDir в workspaceRoot
+        const clonedFiles = await fs.readdir(cloneTempDir);
+        for (const file of clonedFiles) {
+            await fs.rename(path.join(cloneTempDir, file), path.join(workspaceRoot, file));
+        }
+
+        await fs.rm(tempDir, { recursive: true, force: true });
+
+        vscode.window.showInformationMessage('Repository cloned successfully! Reloading window...');
+
+        // Перезагружаем окно, чтобы VS Code подхватил новый репозиторий
+        vscode.commands.executeCommand('workbench.action.reloadWindow');
+
+    } catch (error) {
+        vscode.window.showErrorMessage(`Clone failed: ${error.message}`);
+        // Очистка в случае ошибки
+        const tempDir = path.join(workspaceRoot, '.gdrive-temp-clone');
+        if (fsSync.existsSync(tempDir)) {
+            await fs.rm(tempDir, { recursive: true, force: true });
+        }
+    }
+}
 
 // --- АУТЕНТИФИКАЦИЯ И УТИЛИТЫ GOOGLE DRIVE ---
 
