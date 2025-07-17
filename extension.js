@@ -326,6 +326,13 @@ async function cloneFromGoogleDrive(context) {
         const cloneTempDir = path.join(tempDir, 'cloned');
         await runCommand(`git clone "${tempBundlePath}" "${cloneTempDir}"`, tempDir);
 
+        // Determine the branch to checkout from the bundle
+        const { stdout: bundleHeads } = await runCommand(`git bundle list-heads "${tempBundlePath}"`, tempDir);
+        // We need to handle both / and \ as path separators
+        const mainBranchMatch = bundleHeads.match(/refs[\\\/]heads[\\\/](.+)/);
+        const branchToCheckout = mainBranchMatch ? mainBranchMatch[1].trim() : null;
+
+
         // Перемещаем все из cloneTempDir в workspaceRoot
         const clonedFiles = await fs.readdir(cloneTempDir);
         for (const file of clonedFiles) {
@@ -333,6 +340,18 @@ async function cloneFromGoogleDrive(context) {
         }
 
         await fs.rm(tempDir, { recursive: true, force: true });
+
+        // Checkout the branch if we found one
+        if (branchToCheckout) {
+            try {
+                await runCommand(`git checkout ${branchToCheckout}`, workspaceRoot);
+                vscode.window.showInformationMessage(`Switched to branch '${branchToCheckout}'.`);
+            } catch (error) {
+                vscode.window.showWarningMessage(`Could not checkout branch '${branchToCheckout}'. Please do it manually.`);
+            }
+        } else {
+            vscode.window.showWarningMessage(`Could not automatically determine the main branch. Please checkout a branch manually.`);
+        }
 
         // После клонирования нам нужно установить начальный хэш, чтобы предотвратить повторное объединение всего репозитория.
         const clonedHead = selectedBundle.label.replace('.bundle', '');
