@@ -163,12 +163,18 @@ async function installGitHooks(context) {
     if (!workspaceRoot) return;
 
     const hooksDir = path.join(workspaceRoot, '.git', 'hooks');
+    const preCommitHookPath = path.join(hooksDir, 'pre-commit');
     const postCommitHookPath = path.join(hooksDir, 'post-commit');
-
-    // Получаем ID расширения из package.json
     const extensionId = 'user.changegittogoogledrive-extension'; // Замените на ваш реальный ID
 
-    const hookScript = `#!/bin/sh
+    const preCommitScript = `#!/bin/sh
+echo "----------------------------------------------------------------"
+echo "REMINDER: Have you synced with Google Drive recently?"
+echo "Run 'Sync with Google Drive' command to pull latest changes."
+echo "----------------------------------------------------------------"
+`;
+
+    const postCommitScript = `#!/bin/sh
 # Hook to trigger VS Code sync after commit
 
 # Check if VS Code command line tool is available
@@ -181,9 +187,16 @@ fi
 
     try {
         await fs.mkdir(hooksDir, { recursive: true });
-        await fs.writeFile(postCommitHookPath, hookScript);
-        await fs.chmod(postCommitHookPath, '755'); // Делаем хук исполняемым
-        vscode.window.showInformationMessage('Successfully installed post-commit hook!');
+
+        // Установка pre-commit хука
+        await fs.writeFile(preCommitHookPath, preCommitScript);
+        await fs.chmod(preCommitHookPath, '755');
+
+        // Установка post-commit хука
+        await fs.writeFile(postCommitHookPath, postCommitScript);
+        await fs.chmod(postCommitHookPath, '755');
+
+        vscode.window.showInformationMessage('Successfully installed pre-commit and post-commit hooks!');
     } catch (error) {
         vscode.window.showErrorMessage(`Failed to install git hooks: ${error.message}`);
     }
