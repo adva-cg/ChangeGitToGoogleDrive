@@ -125,7 +125,8 @@ async function pullCommits(context) {
     // 1. Получаем список всех бандлов с Google Drive
     const { data: { files: remoteBundles } } = await drive.files.list({
         q: `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle'`,
-        fields: 'files(id, name)',
+        fields: 'files(id, name, createdTime)',
+        orderBy: 'createdTime',
     });
 
     if (!remoteBundles || remoteBundles.length === 0) {
