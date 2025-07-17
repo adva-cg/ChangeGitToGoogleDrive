@@ -1,0 +1,33 @@
+{
+  "type": "drakon",
+  "items": {
+    "1": {
+      "type": "end"
+    },
+    "2": {
+      "type": "branch",
+      "branchId": 0,
+      "one": "3"
+    },
+    "3": {
+      "type": "action",
+      "content": "Выполнить команду \"Установить учетные данные Google\"",
+      "one": "4"
+    },
+    "4": {
+      "type": "action",
+      "content": "В диалоговом окне выбрать свой файл client_secret.json",
+      "one": "5"
+    },
+    "5": {
+      "type": "action",
+      "content": "Выполнить команду \"Аутентификация с Google\"",
+      "one": "6"
+    },
+    "6": {
+      "type": "action",
+      "content": "В открывшемся браузере разрешить доступ к вашему Google-аккаунту",
+      "one": "1"
+    }
+  }
+}

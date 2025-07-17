@@ -6,7 +6,7 @@
       "content": "Пользовательские команды",
       "parent": "root",
       "treeType": "treeview",
-      "ordinal": 1
+      "ordinal": 3
     },
     "2": {
       "type": "idea",
@@ -45,10 +45,122 @@
     },
     "8": {
       "type": "conclusion",
-      "content": "Для использования google drive в качестве \"удаленного репозитария git\"",
+      "content": "расширение для VS Code позволяет синхронизировать ваш локальный Git-репозиторий с Google Drive. Оно не создает полноценный git remote, а использует Google Drive как \"транспорт\" для обмена данными с помощью файлов-бандлов (.bundle).",
       "parent": "7",
       "treeType": "treeview",
       "ordinal": 0
+    },
+    "9": {
+      "type": "ridea",
+      "content": "Цели использования",
+      "parent": "root",
+      "treeType": "treeview",
+      "ordinal": 1
+    },
+    "10": {
+      "type": "idea",
+      "content": "Резервного копирования",
+      "parent": "9",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "11": {
+      "type": "conclusion",
+      "content": "хранения копии репозитория в облаке",
+      "parent": "10",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "12": {
+      "type": "idea",
+      "content": "Работы оффлайн",
+      "parent": "9",
+      "treeType": "treeview",
+      "ordinal": 1
+    },
+    "13": {
+      "type": "conclusion",
+      "content": "обмен изменениями между компьютерами без доступа к центральному Git-серверу (вроде GitHub/GitLab)",
+      "parent": "12",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "14": {
+      "type": "idea",
+      "content": "Простой обмен кодом",
+      "parent": "9",
+      "treeType": "treeview",
+      "ordinal": 2
+    },
+    "16": {
+      "type": "conclusion",
+      "content": "когда нужно передать всю историю проекта в одном файле",
+      "parent": "14",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "17": {
+      "type": "ridea",
+      "content": "Принцип работы",
+      "parent": "root",
+      "treeType": "treeview",
+      "ordinal": 2
+    },
+    "18": {
+      "type": "idea",
+      "content": "Настройка",
+      "parent": "17",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "19": {
+      "type": "idea",
+      "content": "Выгрузка изменений (Push)",
+      "parent": "17",
+      "treeType": "treeview",
+      "ordinal": 1
+    },
+    "20": {
+      "type": "idea",
+      "content": "Загрузка изменений (Pull)",
+      "parent": "17",
+      "treeType": "treeview",
+      "ordinal": 2
+    },
+    "21": {
+      "type": "conclusion",
+      "content": "Сначала вы должны указать расширению ваш файл client_secret.json от Google Cloud и пройти аутентификацию. Расширение надежно сохранит полученные токены для будущих сессий.",
+      "parent": "18",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "22": {
+      "type": "conclusion",
+      "content": "Когда вы запускаете sync или initialUpload, расширение создает \"бандл\" — специальный файл Git, содержащий всю историю коммитов для вашей текущей ветки (git bundle create ...).\nОно находит на вашем Google Drive папку с именем .gdrive-git/<имя_вашего_проекта>/. Если папки нет, оно её создаёт.\nВ эту папку загружается (или обновляется) файл бандла, названный по имени вашей ветки (например, main.bundle).",
+      "parent": "19",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "23": {
+      "type": "conclusion",
+      "content": "Когда вы запускаете sync, расширение сначала пытается скачать изменения.\nОно ищет на Google Drive бандл-файл для вашей текущей ветки.\nЕсли файл найден, оно скачивает его и выполняет команду git pull из этого локального файла. Git автоматически \"подтягивает\" недостающие коммиты и пытается слить их с вашей текущей работой.\nЕсли возникают конфликты слияния, расширение сообщает об этом, и вы можете разрешить их стандартными средствами Git.",
+      "parent": "20",
+      "treeType": "treeview",
+      "ordinal": 0
+    },
+    "24": {
+      "type": "idea",
+      "content": "initialUpload",
+      "parent": "1",
+      "treeType": "treeview",
+      "ordinal": 2
+    },
+    "25": {
+      "type": "idea",
+      "content": "sync",
+      "parent": "1",
+      "treeType": "treeview",
+      "ordinal": 3
     }
   }
 }

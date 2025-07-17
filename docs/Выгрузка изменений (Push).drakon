@@ -1,0 +1,40 @@
+{
+  "type": "drakon",
+  "items": {
+    "1": {
+      "type": "end"
+    },
+    "2": {
+      "type": "branch",
+      "branchId": 0,
+      "one": "3"
+    },
+    "3": {
+      "type": "action",
+      "content": "Определить текущую ветку Git (например, main)",
+      "one": "4"
+    },
+    "4": {
+      "type": "action",
+      "content": "Создать локальный файл main.bundle командой git bundle create",
+      "one": "5"
+    },
+    "5": {
+      "type": "action",
+      "content": "Найти на Google Drive папку .gdrive-git/<имя_проекта>",
+      "one": "6"
+    },
+    "6": {
+      "type": "question",
+      "content": "Папка найдена",
+      "one": "7",
+      "two": "1",
+      "flag1": 0
+    },
+    "7": {
+      "type": "action",
+      "content": "Создать папку .gdrive-git/<имя_проекта> на Google Drive.",
+      "one": "1"
+    }
+  }
+}
