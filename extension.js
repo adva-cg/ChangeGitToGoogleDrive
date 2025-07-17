@@ -9,416 +9,351 @@ const http = require('http');
 
 const REDIRECT_URI = 'http://localhost:8080/oauth2callback';
 
-// Ключи для хранения в SecretStorage и workspaceState
+// Ключи для хранения
 const GOOGLE_DRIVE_CREDENTIALS_KEY = 'googleDriveCredentials';
 const GOOGLE_DRIVE_TOKENS_KEY = 'googleDriveTokens';
+const LAST_PUSHED_HASH_KEY_PREFIX = 'lastPushedHash_'; // Prefix + branch name
 
 function activate(context) {
-    // Команда для установки учетных данных
-    let setupCredentialsDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.setupGoogleCredentials', async () => {
-        try {
-            await setupGoogleCredentials(context);
-        } catch (error) {
-            vscode.window.showErrorMessage(`Failed to set up Google credentials: ${error.message}`);
-        }
-    });
+    // --- РЕГИСТРАЦИЯ КОМАНД ---
+    context.subscriptions.push(
+        vscode.commands.registerCommand('changegittogoogledrive-extension.setupGoogleCredentials', () => setupGoogleCredentials(context)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.authenticateWithGoogle', () => authenticateWithGoogle(context)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.initialUpload', () => pushCommits(context)), // initialUpload это просто первый push
+        vscode.commands.registerCommand('changegittogoogledrive-extension.sync', () => sync(context)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.installGitHooks', () => installGitHooks(context))
+    );
 
-    // Команда аутентификации
-    let authDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.authenticateWithGoogle', async () => {
-        try {
-            await authenticateWithGoogle(context);
-        } catch (error) {
-            vscode.window.showErrorMessage(`Authentication failed: ${error.message}`);
-        }
-    });
-
-    // Команда начальной выгрузки
-    let initialUploadDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.initialUpload', async () => {
-        try {
-            await initialUpload(context);
-        } catch (error) {
-            vscode.window.showErrorMessage(`Initial upload failed: ${error.message}`);
-        }
-    });
-
-    // Команда синхронизации
-    let syncDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.sync', async () => {
-        try {
-            await sync(context);
-        } catch (error) {
-            vscode.window.showErrorMessage(`Sync failed: ${error.message}`);
-        }
-    });
-
-    let installHooksDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.installGitHooks', async () => {
-        try {
-            await installGitHooks(context);
-        } catch (error) {
-            vscode.window.showErrorMessage(`Failed to install git hooks: ${error.message}`);
-        }
-    });
-
-    context.subscriptions.push(setupCredentialsDisposable, authDisposable, initialUploadDisposable, syncDisposable, installHooksDisposable);
-}
-
-// --- Подпрограмма: "Установка учетных данных" ---
-async function setupGoogleCredentials(context) {
-    const options = {
-        canSelectMany: false,
-        openLabel: 'Select client_secret.json',
-        filters: {
-            'JSON files': ['json']
-        }
-    };
-
-    const fileUri = await vscode.window.showOpenDialog(options);
-
-    if (fileUri && fileUri[0]) {
-        try {
-            const filePath = fileUri[0].fsPath;
-            const fileContent = await fs.readFile(filePath, 'utf8');
-            // Проверяем, что это действительно файл учетных данных
-            const credentials = JSON.parse(fileContent);
-            if (credentials.installed || credentials.web) {
-                await context.secrets.store(GOOGLE_DRIVE_CREDENTIALS_KEY, fileContent);
-                vscode.window.showInformationMessage('Google credentials have been set up successfully.');
-            } else {
-                vscode.window.showErrorMessage('Invalid credentials file. Please select the correct client_secret.json file.');
-            }
-        } catch (error) {
-            vscode.window.showErrorMessage(`Error reading or parsing credentials file: ${error.message}`);
-        }
-    } else {
-        vscode.window.showInformationMessage('Credential setup cancelled.');
-    }
-}
-
-// --- Подпрограмма: "Аутентификация" ---
-async function authenticateWithGoogle(context) {
-    try {
-        const credentialsStr = await context.secrets.get(GOOGLE_DRIVE_CREDENTIALS_KEY);
-        if (!credentialsStr) {
-            vscode.window.showErrorMessage('Google credentials are not set up. Please run the "Setup Google Credentials" command first.');
-            return;
-        }
-
-        const credentials = JSON.parse(credentialsStr);
-        const credsType = credentials.web ? 'web' : 'installed';
-        const { client_id, client_secret, redirect_uris } = credentials[credsType];
-        const redirect_uri = redirect_uris[0];
-
-        if (!redirect_uri.includes('localhost')) {
-            vscode.window.showErrorMessage('Only localhost redirect URIs are supported for this extension.');
-            return;
-        }
-
-        const port = new url.URL(redirect_uri).port;
-
-        const oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uri);
-
-        return new Promise((resolve, reject) => {
-            const server = http.createServer(async (req, res) => {
-                const qs = new url.URL(req.url, `http://localhost:${port}`).searchParams;
-                const code = qs.get('code');
-                const error = qs.get('error');
-
-                if (error) {
-                    res.writeHead(500);
-                    res.end(`Authentication failed: ${error}`);
-                    server.close();
-                    return reject(new Error(`Authentication error from Google: ${error}`));
-                }
-
-                if (!code) {
-                    res.writeHead(400);
-                    res.end('Authentication failed: Authorization code not found in callback.');
-                    server.close();
-                    return reject(new Error('Authorization code not found in callback.'));
-                }
-
+    // --- РЕГИСТРАЦИЯ ОБРАБОТЧИКА URI ДЛЯ GIT HOOKS ---
+    context.subscriptions.push(vscode.window.registerUriHandler({
+        async handleUri(uri) {
+            if (uri.path === '/sync') {
+                vscode.window.showInformationMessage('Git hook triggered sync...');
                 try {
-                    const { tokens } = await oauth2Client.getToken(code);
-                    await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(tokens));
-                    
-                    const storedTokens = await context.secrets.get(GOOGLE_DRIVE_TOKENS_KEY);
-                    if (storedTokens) {
-                        vscode.window.showInformationMessage('Successfully authenticated with Google Drive and tokens are stored!');
-                        res.end('Authentication successful! You can close this browser tab.');
-                    } else {
-                        vscode.window.showErrorMessage('Authentication succeeded, but failed to store tokens. Please check your system keychain access.');
-                        res.writeHead(500);
-                        res.end('Authentication failed on server: Could not store tokens.');
-                    }
-                    resolve();
-                } catch (e) {
-                    vscode.window.showErrorMessage(`Failed to get or store tokens: ${e.message}`);
-                    res.writeHead(500);
-                    res.end('Authentication failed on server. Please check the extension logs.');
-                    reject(new Error(`Failed to get tokens: ${e.message}`));
-                } finally {
-                    server.close();
+                    await sync(context);
+                } catch (error) {
+                    vscode.window.showErrorMessage(`Sync from hook failed: ${error.message}`);
                 }
-            }).listen(port, () => {
-                const authUrl = oauth2Client.generateAuthUrl({
-                    access_type: 'offline',
-                    scope: ['https://www.googleapis.com/auth/drive.file'],
-                    prompt: 'consent'
-                });
-                vscode.env.openExternal(vscode.Uri.parse(authUrl));
-            });
-
-            server.on('error', (e) => {
-                reject(new Error(`Authentication server could not be started: ${e.message}`));
-            });
-        });
-    } catch (error) {
-        vscode.window.showErrorMessage(`Authentication failed: ${error.message}`);
-    }
+            }
+        }
+    }));
 }
 
-// --- Подпрограмма: "Начальная выгрузка" ---
-async function initialUpload(context) {
-    // Новая функция pushCommits обрабатывает начальный случай корректно.
-    vscode.window.showInformationMessage('Starting initial upload. This may take a while for large repositories...');
-    await pushCommits(context);
-}
+// --- ОСНОВНЫЕ КОМАНДЫ ---
 
-// --- Подпрограмма: "Синхронизация" ---
 async function sync(context) {
-    vscode.window.showInformationMessage('Starting sync...');
+    vscode.window.showInformationMessage('Syncing with Google Drive...');
     await pullCommits(context);
     await pushCommits(context);
     vscode.window.showInformationMessage('Sync finished.');
 }
 
-// --- Подпрограмма: "Выгрузка изменений (Push)" ---
 async function pushCommits(context) {
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (!workspaceFolders) {
-        vscode.window.showErrorMessage('No workspace folder is open.');
-        return;
-    }
-    const workspaceRoot = workspaceFolders[0].uri.fsPath;
-    const currentBranch = await getCurrentBranch(workspaceRoot);
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
 
     const drive = await getAuthenticatedClient(context);
-    if (!drive) {
-        vscode.window.showErrorMessage('Authentication with Google Drive is required.');
+    if (!drive) return;
+
+    const currentBranch = await getCurrentBranch(workspaceRoot);
+    const lastPushedHash = context.workspaceState.get(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`);
+    const currentHead = (await runCommand('git rev-parse HEAD', workspaceRoot)).stdout.trim();
+
+    if (lastPushedHash === currentHead) {
+        vscode.window.showInformationMessage('Already up-to-date. Nothing to push.');
         return;
     }
 
-    const projectName = path.basename(workspaceRoot);
-    const gdriveGitDir = `.gdrive-git/${projectName}`;
-    const bundleName = `${currentBranch}.bundle`;
-    // Сохраняем бандл в .git, чтобы избежать рекурсии и случайного добавления в коммиты
-    const bundlePath = path.join(workspaceRoot, '.git', bundleName);
+    const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
+    if (!bundleFolderId) return;
+
+    const revisionRange = lastPushedHash ? `${lastPushedHash}..HEAD` : 'HEAD';
+    const { stdout: commitsToPush } = await runCommand(`git rev-list ${revisionRange}`, workspaceRoot);
+
+    if (!commitsToPush.trim()) {
+        vscode.window.showInformationMessage('No new commits to push.');
+        return;
+    }
+
+    const bundleFileName = `${currentHead}.bundle`;
+    const bundlePath = path.join(workspaceRoot, '.git', bundleFileName);
 
     try {
-        // 1. Находим или создаем папку проекта на Google Drive
-        let { data: { files: projectFolders } } = await drive.files.list({
-            q: `name='${gdriveGitDir}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-            fields: 'files(id)',
-        });
+        vscode.window.showInformationMessage(`Creating bundle for range: ${revisionRange}`);
+        const bundleCommand = `git bundle create "${bundlePath}" ${revisionRange}`;
+        await runCommand(bundleCommand, workspaceRoot);
 
-        let projectFolderId;
-        if (projectFolders.length === 0) {
-            vscode.window.showInformationMessage(`Project folder not found on Google Drive. Creating '${gdriveGitDir}'...`);
-            const { data: projectFolder } = await drive.files.create({
-                resource: {
-                    name: gdriveGitDir,
-                    mimeType: 'application/vnd.google-apps.folder',
-                },
-                fields: 'id',
-            });
-            projectFolderId = projectFolder.id;
-        } else {
-            projectFolderId = projectFolders[0].id;
-        }
+        await uploadFile(drive, bundlePath, bundleFolderId);
 
-        // 2. Создаем git bundle
-        vscode.window.showInformationMessage(`Creating bundle for branch '${currentBranch}'...`);
-        await runCommand(`git bundle create "${bundlePath}" HEAD`, workspaceRoot);
-
-        // 3. Проверяем, существует ли уже файл бандла на диске
-        const { data: { files: existingBundles } } = await drive.files.list({
-            q: `name='${bundleName}' and '${projectFolderId}' in parents and trashed=false`,
-            fields: 'files(id)',
-        });
-
-        // 4. Загружаем бандл
-        const media = {
-            mimeType: 'application/octet-stream',
-            body: fsSync.createReadStream(bundlePath),
-        };
-        const fileMetadata = {
-            name: bundleName,
-        };
-
-        if (existingBundles.length > 0) {
-            vscode.window.showInformationMessage(`Updating existing bundle on Google Drive...`);
-            await drive.files.update({
-                fileId: existingBundles[0].id,
-                media: media,
-            });
-        } else {
-            vscode.window.showInformationMessage(`Uploading new bundle to Google Drive...`);
-            fileMetadata.parents = [projectFolderId];
-            await drive.files.create({
-                resource: fileMetadata,
-                media: media,
-                fields: 'id',
-            });
-        }
-
-        vscode.window.showInformationMessage(`Successfully pushed branch '${currentBranch}' to Google Drive.`);
+        await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`, currentHead);
+        vscode.window.showInformationMessage(`Successfully pushed commits up to ${currentHead.substring(0, 7)}.`);
 
     } catch (error) {
         vscode.window.showErrorMessage(`Push failed: ${error.message}`);
     } finally {
-        // 5. Очищаем локальный файл бандла
         if (fsSync.existsSync(bundlePath)) {
             await fs.unlink(bundlePath);
         }
     }
 }
 
-// --- Подпрограмма: "Загрузка изменений (Pull)" ---
 async function pullCommits(context) {
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (!workspaceFolders) {
-        vscode.window.showErrorMessage('No workspace folder is open.');
-        return;
-    }
-    const workspaceRoot = workspaceFolders[0].uri.fsPath;
-    const currentBranch = await getCurrentBranch(workspaceRoot);
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
 
     const drive = await getAuthenticatedClient(context);
-    if (!drive) {
-        vscode.window.showErrorMessage('Authentication with Google Drive is required.');
+    if (!drive) return;
+
+    const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
+    if (!bundleFolderId) return;
+
+    // 1. Получаем список всех бандлов с Google Drive
+    const { data: { files: remoteBundles } } = await drive.files.list({
+        q: `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle'`,
+        fields: 'files(id, name)',
+    });
+
+    if (!remoteBundles || remoteBundles.length === 0) {
+        vscode.window.showInformationMessage('No remote commits found to pull.');
         return;
     }
 
-    const projectName = path.basename(workspaceRoot);
-    const gdriveGitDir = `.gdrive-git/${projectName}`;
-    const bundleName = `${currentBranch}.bundle`;
-    const tempBundlePath = path.join(workspaceRoot, '.git', `gdrive-${currentBranch}.bundle`);
+    // 2. Получаем список всех коммитов, которые есть локально
+    const { stdout: localCommitsResult } = await runCommand('git rev-list --all --pretty=format:%H', workspaceRoot);
+    const localCommitSet = new Set(localCommitsResult.trim().split(/\s+/));
+
+    // 3. Определяем, какие бандлы нужно скачать
+    const bundlesToDownload = remoteBundles.filter(bundle => !localCommitSet.has(bundle.name.replace('.bundle', '')));
+
+    if (bundlesToDownload.length === 0) {
+        vscode.window.showInformationMessage('Local repository is up-to-date.');
+        return;
+    }
+
+    vscode.window.showInformationMessage(`Found ${bundlesToDownload.length} new commit(s) to download.`);
+
+    const tempDir = path.join(workspaceRoot, '.git', 'gdrive-temp-bundles');
+    await fs.mkdir(tempDir, { recursive: true });
 
     try {
-        // 1. Находим папку проекта
-        const { data: { files: projectFolders } } = await drive.files.list({
-            q: `name='${gdriveGitDir}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-            fields: 'files(id)',
-        });
+        for (const bundle of bundlesToDownload) {
+            const tempBundlePath = path.join(tempDir, bundle.name);
+            const dest = fsSync.createWriteStream(tempBundlePath);
+            const { data: fileStream } = await drive.files.get({ fileId: bundle.id, alt: 'media' }, { responseType: 'stream' });
+            await new Promise((resolve, reject) => {
+                fileStream.pipe(dest).on('finish', resolve).on('error', reject);
+            });
 
-        if (projectFolders.length === 0) {
-            vscode.window.showInformationMessage(`No remote found for project '${projectName}'. Nothing to pull.`);
-            return;
+            // 4. Применяем бандл через fetch. Это безопасно и не меняет рабочую копию.
+            await runCommand(`git fetch "${tempBundlePath}"`, workspaceRoot);
+            vscode.window.showInformationMessage(`Fetched commit ${bundle.name.substring(0, 7)}.`);
         }
-        const projectFolderId = projectFolders[0].id;
 
-        // 2. Находим файл бандла
-        const { data: { files: bundleFiles } } = await drive.files.list({
-            q: `name='${bundleName}' and '${projectFolderId}' in parents and trashed=false`,
-            fields: 'files(id)',
-        });
-
-        if (bundleFiles.length === 0) {
-            vscode.window.showInformationMessage(`No remote bundle found for branch '${currentBranch}'. Nothing to pull.`);
-            return;
-        }
-        const bundleFileId = bundleFiles[0].id;
-
-        // 3. Скачиваем бандл
-        vscode.window.showInformationMessage(`Downloading bundle for branch '${currentBranch}'...`);
-        const dest = fsSync.createWriteStream(tempBundlePath);
-        const { data: fileStream } = await drive.files.get({ fileId: bundleFileId, alt: 'media' }, { responseType: 'stream' });
-        await new Promise((resolve, reject) => {
-            fileStream.on('end', resolve);
-            fileStream.on('error', reject);
-            fileStream.pipe(dest);
-        });
-
-        // 4. Выполняем pull из бандла
-        vscode.window.showInformationMessage('Applying changes from bundle...');
-        try {
-            const commandPath = tempBundlePath.replace(/\\/g, '/');
-            await runCommand(`git pull "${commandPath}"`, workspaceRoot);
-            vscode.window.showInformationMessage(`Successfully pulled and merged changes for branch '${currentBranch}'.`);
-        } catch (error) {
-            if (error.message.includes('conflict')) {
-                vscode.window.showWarningMessage('Merge conflict detected. Please resolve conflicts and commit.');
-            } else if (error.message.includes('Already up to date')) {
-                vscode.window.showInformationMessage('Already up-to-date.');
-            } else {
-                throw error;
-            }
-        }
+        vscode.window.showInformationMessage('All new commits have been fetched. Please merge or rebase your branch as needed.');
 
     } catch (error) {
         vscode.window.showErrorMessage(`Pull failed: ${error.message}`);
     } finally {
-        // 5. Очищаем временный файл
-        if (fsSync.existsSync(tempBundlePath)) {
-            await fs.unlink(tempBundlePath);
-        }
+        await fs.rm(tempDir, { recursive: true, force: true });
+    }
+}
+
+async function installGitHooks(context) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
+
+    const hooksDir = path.join(workspaceRoot, '.git', 'hooks');
+    const postCommitHookPath = path.join(hooksDir, 'post-commit');
+
+    // Получаем ID расширения из package.json
+    const extensionId = 'user.changegittogoogledrive-extension'; // Замените на ваш реальный ID
+
+    const hookScript = `#!/bin/sh
+# Hook to trigger VS Code sync after commit
+
+# Check if VS Code command line tool is available
+if command -v code >/dev/null 2>&1; then
+  code --open-url "vscode://${extensionId}/sync"
+else
+  echo "VS Code command 'code' not found in PATH. Cannot trigger sync."
+fi
+`;
+
+    try {
+        await fs.mkdir(hooksDir, { recursive: true });
+        await fs.writeFile(postCommitHookPath, hookScript);
+        await fs.chmod(postCommitHookPath, '755'); // Делаем хук исполняемым
+        vscode.window.showInformationMessage('Successfully installed post-commit hook!');
+    } catch (error) {
+        vscode.window.showErrorMessage(`Failed to install git hooks: ${error.message}`);
     }
 }
 
 
-// --- Вспомогательные функции ---
+// --- АУТЕНТИФИКАЦИЯ И УТИЛИТЫ GOOGLE DRIVE ---
 
-async function getAuthenticatedClient(context) {
+async function setupGoogleCredentials(context) {
+    const fileUri = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        openLabel: 'Select client_secret.json',
+        filters: { 'JSON files': ['json'] }
+    });
+
+    if (fileUri && fileUri[0]) {
+        try {
+            const fileContent = await fs.readFile(fileUri[0].fsPath, 'utf8');
+            const credentials = JSON.parse(fileContent);
+            if (credentials.installed || credentials.web) {
+                await context.secrets.store(GOOGLE_DRIVE_CREDENTIALS_KEY, fileContent);
+                vscode.window.showInformationMessage('Google credentials stored successfully.');
+            } else {
+                throw new Error('Invalid credentials file format.');
+            }
+        } catch (error) {
+            vscode.window.showErrorMessage(`Error processing credentials file: ${error.message}`);
+        }
+    }
+}
+
+async function authenticateWithGoogle(context) {
     const credentialsStr = await context.secrets.get(GOOGLE_DRIVE_CREDENTIALS_KEY);
     if (!credentialsStr) {
-        return null;
+        vscode.window.showErrorMessage('Set up Google Credentials first.');
+        return;
     }
 
     const credentials = JSON.parse(credentialsStr);
     const credsType = credentials.web ? 'web' : 'installed';
     const { client_id, client_secret, redirect_uris } = credentials[credsType];
     const redirect_uri = redirect_uris[0];
+    const port = new url.URL(redirect_uri).port;
 
     const oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uri);
 
+    const server = http.createServer(async (req, res) => {
+        try {
+            const code = new url.URL(req.url, `http://localhost:${port}`).searchParams.get('code');
+            res.end('Authentication successful! You can close this tab.');
+            server.close();
+            const { tokens } = await oauth2Client.getToken(code);
+            await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(tokens));
+            vscode.window.showInformationMessage('Successfully authenticated with Google.');
+        } catch (e) {
+            vscode.window.showErrorMessage(`Authentication failed: ${e.message}`);
+            res.end('Authentication failed. Check logs.');
+            server.close();
+        }
+    }).listen(port, () => {
+        const authUrl = oauth2Client.generateAuthUrl({
+            access_type: 'offline', 
+            scope: ['https://www.googleapis.com/auth/drive.file'], 
+            prompt: 'consent'
+        });
+        vscode.env.openExternal(vscode.Uri.parse(authUrl));
+    });
+}
+
+async function getAuthenticatedClient(context) {
+    const credentialsStr = await context.secrets.get(GOOGLE_DRIVE_CREDENTIALS_KEY);
     const tokensStr = await context.secrets.get(GOOGLE_DRIVE_TOKENS_KEY);
-    if (!tokensStr) {
+
+    if (!credentialsStr || !tokensStr) {
+        vscode.window.showErrorMessage('Authentication required. Please run authentication command.');
         return null;
     }
 
-    const tokens = JSON.parse(tokensStr);
-    oauth2Client.setCredentials(tokens);
+    const credentials = JSON.parse(credentialsStr);
+    const credsType = credentials.web ? 'web' : 'installed';
+    const { client_id, client_secret, redirect_uris } = credentials[credsType];
+    const oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
 
-    // Проверяем, не истек ли токен, и обновляем его при необходимости
+    oauth2Client.setCredentials(JSON.parse(tokensStr));
+
     if (oauth2Client.isTokenExpiring()) {
         try {
-            const { credentials: newCredentials } = await oauth2Client.refreshAccessToken();
-            await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(newCredentials));
-            oauth2Client.setCredentials(newCredentials);
+            const { credentials: newTokens } = await oauth2Client.refreshAccessToken();
+            await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(newTokens));
+            oauth2Client.setCredentials(newTokens);
         } catch (error) {
-            vscode.window.showErrorMessage(`Failed to refresh access token: ${error.message}`);
-            // Запускаем процесс аутентификации заново, если токен не удалось обновить
+            vscode.window.showErrorMessage(`Failed to refresh token: ${error.message}. Please re-authenticate.`);
             await authenticateWithGoogle(context);
-            return null; // Возвращаем null, так как аутентификация еще не завершена
+            return null;
         }
     }
-
     return google.drive({ version: 'v3', auth: oauth2Client });
 }
 
-async function installGitHooks(context) {
-    vscode.window.showInformationMessage('Git hook installation is not implemented in this version.');
+async function findOrCreateProjectFolders(drive, workspaceRoot) {
+    const projectName = path.basename(workspaceRoot);
+    const gdriveGitDir = `.gdrive-git`;
+    const projectDir = `${gdriveGitDir}/${projectName}`;
+    const bundlesDir = `bundles`;
+
+    // Find .gdrive-git folder
+    let { data: { files: rootFolders } } = await drive.files.list({ q: `name='${gdriveGitDir}' and mimeType='application/vnd.google-apps.folder' and trashed=false`, fields: 'files(id)' });
+    let rootFolderId;
+    if (rootFolders.length === 0) {
+        const { data } = await drive.files.create({ resource: { name: gdriveGitDir, mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' });
+        rootFolderId = data.id;
+    } else {
+        rootFolderId = rootFolders[0].id;
+    }
+
+    // Find project folder
+    let { data: { files: projectFolders } } = await drive.files.list({ q: `name='${projectName}' and mimeType='application/vnd.google-apps.folder' and '${rootFolderId}' in parents and trashed=false`, fields: 'files(id)' });
+    let projectFolderId;
+    if (projectFolders.length === 0) {
+        const { data } = await drive.files.create({ resource: { name: projectName, mimeType: 'application/vnd.google-apps.folder', parents: [rootFolderId] }, fields: 'id' });
+        projectFolderId = data.id;
+    } else {
+        projectFolderId = projectFolders[0].id;
+    }
+
+    // Find bundles folder
+    let { data: { files: bundlesFolders } } = await drive.files.list({ q: `name='${bundlesDir}' and mimeType='application/vnd.google-apps.folder' and '${projectFolderId}' in parents and trashed=false`, fields: 'files(id)' });
+    let bundlesFolderId;
+    if (bundlesFolders.length === 0) {
+        const { data } = await drive.files.create({ resource: { name: bundlesDir, mimeType: 'application/vnd.google-apps.folder', parents: [projectFolderId] }, fields: 'id' });
+        bundlesFolderId = data.id;
+    } else {
+        bundlesFolderId = bundlesFolders[0].id;
+    }
+
+    return bundlesFolderId;
 }
 
-function runCommand(command, cwd, options = {}) {
-    const execOptions = { encoding: 'utf8', cwd };
-    Object.assign(execOptions, options);
+async function uploadFile(drive, filePath, parentFolderId) {
+    const fileName = path.basename(filePath);
+    const media = {
+        mimeType: 'application/octet-stream',
+        body: fsSync.createReadStream(filePath),
+    };
+    await drive.files.create({
+        resource: { name: fileName, parents: [parentFolderId] },
+        media: media,
+        fields: 'id',
+    });
+}
+
+
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+function getWorkspaceRoot() {
+    if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+        return vscode.workspace.workspaceFolders[0].uri.fsPath;
+    }
+    vscode.window.showErrorMessage('No workspace folder is open.');
+    return null;
+}
+
+function runCommand(command, cwd) {
     return new Promise((resolve, reject) => {
-        exec(command, execOptions, (error, stdout, stderr) => {
+        exec(command, { cwd, encoding: 'utf8' }, (error, stdout, stderr) => {
             if (error) {
-                console.error(`exec error: ${error}`);
                 return reject(error);
             }
             if (stderr) {
+                // Git often uses stderr for progress messages, so we don't reject on stderr.
                 console.warn(`stderr: ${stderr}`);
             }
             resolve({ stdout, stderr });
@@ -432,7 +367,7 @@ async function getCurrentBranch(cwd) {
         return stdout.trim();
     } catch (error) {
         vscode.window.showErrorMessage('Could not determine the current git branch.');
-        throw new Error('Failed to get current branch');
+        throw error;
     }
 }
 
