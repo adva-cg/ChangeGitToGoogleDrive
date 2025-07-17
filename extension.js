@@ -60,11 +60,25 @@ async function pushCommits(context) {
     const currentHead = (await runCommand('git rev-parse HEAD', workspaceRoot)).stdout.trim();
 
     if (lastPushedHash === currentHead) {
-        vscode.window.showInformationMessage('Already up-to-date. Nothing to push.');
-        return;
-    }
+            vscode.window.showInformationMessage('Already up-to-date. Nothing to push.');
+            return;
+        }
 
-    const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
+        // Check for rewritten history before pushing
+        if (lastPushedHash) {
+            try {
+                await runCommand(`git merge-base --is-ancestor ${lastPushedHash} HEAD`, workspaceRoot);
+            } catch (error) {
+                vscode.window.showErrorMessage(
+                    `Push aborted: History has been rewritten (e.g., via rebase or amend) after the last sync. ` +
+                    `Pushing is blocked to prevent corrupting the shared history. ` +
+                    `Recommendation: Use 'git revert' to undo changes that are already synced.`
+                );
+                return; // Abort the push
+            }
+        }
+
+        const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
     if (!bundleFolderId) return;
 
     const revisionRange = lastPushedHash ? `${lastPushedHash}..HEAD` : 'HEAD';
