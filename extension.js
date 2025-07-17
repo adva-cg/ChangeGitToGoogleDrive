@@ -324,9 +324,20 @@ async function cloneFromGoogleDrive(context) {
         }
 
 
-        vscode.window.showInformationMessage('Repository cloned successfully! Reloading window...');
+        vscode.window.showInformationMessage('Repository cloned successfully!');
+
+        const installHooks = await vscode.window.showInformationMessage(
+            'Do you want to install Git hooks to automatically sync on commit?',
+            { modal: true }, // Делаем сообщение модальным
+            'Yes'
+        );
+
+        if (installHooks === 'Yes') {
+            await installGitHooks(context);
+        }
 
         // Перезагружаем окно, чтобы VS Code подхватил новый репозиторий
+        vscode.window.showInformationMessage('Reloading window to apply changes...');
         vscode.commands.executeCommand('workbench.action.reloadWindow');
 
     } catch (error) {
