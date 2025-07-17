@@ -31,7 +31,7 @@
       },
       {
         "command": "changegittogoogledrive-extension.sync",
-        "title": "Sync with Google Drive",
+        "title": "Синхронизация с Google Drive",
         "category": "Git-To-Google-Drive"
       },
       {
@@ -46,7 +46,7 @@
       },
       {
         "command": "changegittogoogledrive-extension.installGitHooks",
-        "title": "Install Git Hooks",
+        "title": "Установить Git Hooks",
         "category": "Git-To-Google-Drive"
       }
     ]
@@ -61,9 +61,6 @@
     "mocha": "^10.2.0"
   },
   "dependencies": {
-    "archiver": "^5.3.1",
-    "googleapis": "^153.0.0",
-    "moment": "^2.29.4",
-    "unzipper": "^0.10.11"
+    "googleapis": "^153.0.0"
   }
 }
