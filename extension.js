@@ -45,25 +45,24 @@ function activate(context) {
         }
     });
 
-    // Команда инкрементальной выгрузки
-    let incrementalUploadDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.incrementalUpload', async () => {
+    // Команда синхронизации
+    let syncDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.sync', async () => {
         try {
-            await incrementalUpload(context);
+            await sync(context);
         } catch (error) {
-            vscode.window.showErrorMessage(`Incremental upload failed: ${error.message}`);
+            vscode.window.showErrorMessage(`Sync failed: ${error.message}`);
         }
     });
 
-    // Команда загрузки
-    let downloadDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.downloadChanges', async () => {
+    let installHooksDisposable = vscode.commands.registerCommand('changegittogoogledrive-extension.installGitHooks', async () => {
         try {
-            await downloadChanges(context);
+            await installGitHooks(context);
         } catch (error) {
-            vscode.window.showErrorMessage(`Download failed: ${error.message}`);
+            vscode.window.showErrorMessage(`Failed to install git hooks: ${error.message}`);
         }
     });
 
-    context.subscriptions.push(setupCredentialsDisposable, authDisposable, initialUploadDisposable, incrementalUploadDisposable, downloadDisposable);
+    context.subscriptions.push(setupCredentialsDisposable, authDisposable, initialUploadDisposable, syncDisposable, installHooksDisposable);
 }
 
 // --- Подпрограмма: "Установка учетных данных" ---
@@ -191,25 +190,85 @@ async function initialUpload(context) {
     const workspaceRoot = workspaceFolders[0].uri.fsPath;
     const currentBranch = await getCurrentBranch(workspaceRoot);
 
-    const { stdout } = await runCommand('git -c core.quotepath=false ls-files', workspaceRoot, { maxBuffer: 1024 * 1024 * 50 });
-    if (!stdout) {
-        vscode.window.showInformationMessage('No files to upload in the repository.');
+    const drive = await getAuthenticatedClient(context);
+    if (!drive) {
+        vscode.window.showErrorMessage('Authentication with Google Drive is required.');
         return;
     }
-    const allFiles = stdout.trim().split('\n');
-    const archivePath = await createAndUploadFullArchive(workspaceRoot, allFiles, currentBranch);
-    if (archivePath) {
-        await uploadToGoogleDrive(context, archivePath);
+
+    const projectName = path.basename(workspaceRoot);
+    const gdriveGitDir = `.gdrive-git/${projectName}`;
+
+    try {
+        // Создаем корневую папку проекта на Google Drive
+        const { data: projectFolder } = await drive.files.create({
+            resource: {
+                name: gdriveGitDir,
+                mimeType: 'application/vnd.google-apps.folder',
+            },
+            fields: 'id',
+        });
+
+        // Создаем папку refs/heads
+        const { data: refsFolder } = await drive.files.create({
+            resource: {
+                name: 'refs',
+                mimeType: 'application/vnd.google-apps.folder',
+                parents: [projectFolder.id],
+            },
+            fields: 'id',
+        });
+        const { data: headsFolder } = await drive.files.create({
+            resource: {
+                name: 'heads',
+                mimeType: 'application/vnd.google-apps.folder',
+                parents: [refsFolder.id],
+            },
+            fields: 'id',
+        });
+
+        // Создаем папку objects
+        await drive.files.create({
+            resource: {
+                name: 'objects',
+                mimeType: 'application/vnd.google-apps.folder',
+                parents: [projectFolder.id],
+            },
+            fields: 'id',
+        });
+
+        // Загружаем текущий хеш ветки
         const { stdout: headHash } = await runCommand('git rev-parse HEAD', workspaceRoot);
+        await drive.files.create({
+            resource: {
+                name: currentBranch,
+                parents: [headsFolder.id],
+            },
+            media: {
+                mimeType: 'text/plain',
+                body: headHash.trim(),
+            },
+        });
+
+        // Сохраняем локально, что мы синхронизированы с этим хешем
         const hashes = context.workspaceState.get(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, {});
         hashes[currentBranch] = headHash.trim();
         await context.workspaceState.update(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, hashes);
-        vscode.window.showInformationMessage(`Initial upload for branch '${currentBranch}' successful.`);
+
+        vscode.window.showInformationMessage(`Successfully initialized Google Drive remote for project \'${projectName}\' and branch \'${currentBranch}\'.`);
+
+    } catch (error) {
+        vscode.window.showErrorMessage(`Failed to initialize Google Drive remote: ${error.message}`);
     }
 }
 
+// --- Подпрограмма: "Синхронизация" ---
+async function sync(context) {
+    await pushCommits(context);
+}
+
 // --- Подпрограмма: "Инкрементальная выгрузка" ---
-async function incrementalUpload(context) {
+async function pushCommits(context) {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders) {
         vscode.window.showErrorMessage('No workspace folder is open.');
@@ -218,83 +277,140 @@ async function incrementalUpload(context) {
     const workspaceRoot = workspaceFolders[0].uri.fsPath;
     const currentBranch = await getCurrentBranch(workspaceRoot);
 
-    const allHashes = context.workspaceState.get(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, {});
-    const lastUploadHash = allHashes[currentBranch];
-
-    if (!lastUploadHash) {
-        vscode.window.showErrorMessage(`No previous upload found for branch '${currentBranch}'. Please run the initial upload first.`);
+    const drive = await getAuthenticatedClient(context);
+    if (!drive) {
+        vscode.window.showErrorMessage('Authentication with Google Drive is required.');
         return;
     }
 
-    const command = `git -c core.quotepath=false log ${lastUploadHash}..HEAD --pretty=format:"%H %aI %s" --reverse`;
-    const { stdout } = await runCommand(command, workspaceRoot);
-    if (!stdout) {
-        vscode.window.showInformationMessage('No new commits to upload.');
-        return;
-    }
-    const commits = stdout.trim().split('\n').filter(Boolean).map(line => {
-        const [hash, date, ...messageParts] = line.split(' ');
-        const message = messageParts.join(' ');
-        return { hash, date, message };
-    });
+    const projectName = path.basename(workspaceRoot);
+    const gdriveGitDir = `.gdrive-git/${projectName}`;
 
-    const tempDir = path.join(workspaceRoot, '.upload-temp');
-    await fs.mkdir(tempDir, { recursive: true });
+    try {
+        // Получаем ID папки проекта
+        const { data: { files: projectFolders } } = await drive.files.list({
+            q: `name=\'${gdriveGitDir}\' and mimeType=\'application/vnd.google-apps.folder\' and trashed=false`,
+            fields: 'files(id)',
+        });
 
-    const logFilePath = path.join(tempDir, 'commits.log');
-    let logContent = `branch: ${currentBranch}\n`;
+        if (projectFolders.length === 0) {
+            vscode.window.showErrorMessage(`Google Drive remote for project \'${projectName}\' not found. Please run initial upload first.`);
+            return;
+        }
+        const projectFolderId = projectFolders[0].id;
 
-    for (const commit of commits) {
-        const commitDir = path.join(tempDir, commit.hash);
-        await fs.mkdir(commitDir, { recursive: true });
+        // Получаем ID папки refs
+        const { data: { files: refsFolders } } = await drive.files.list({
+            q: `name=\'refs\' and mimeType=\'application/vnd.google-apps.folder\' and \'${projectFolderId}\' in parents and trashed=false`,
+            fields: 'files(id)',
+        });
+        const { data: { files: headsFolders } } = await drive.files.list({
+            q: `name=\'heads\' and mimeType=\'application/vnd.google-apps.folder\' and \'${refsFolders[0].id}\' in parents and trashed=false`,
+            fields: 'files(id)',
+        });
+        const headsFolderId = headsFolders[0].id;
 
-        const { stdout: files } = await runCommand(`git -c core.quotepath=false show --name-status --pretty="" ${commit.hash}`, workspaceRoot);
-        const changedFilesWithStatus = files.trim().split('\n').filter(Boolean);
-        const deletedFiles = [];
+        // Получаем ID папки objects
+        const { data: { files: objectsFolders } } = await drive.files.list({
+            q: `name=\'objects\' and mimeType=\'application/vnd.google-apps.folder\' and \'${projectFolderId}\' in parents and trashed=false`,
+            fields: 'files(id)',
+        });
+        const objectsFolderId = objectsFolders[0].id;
 
-        for (const line of changedFilesWithStatus) {
-            const parts = line.split('\t');
-            const status = parts[0];
+        // Получаем последний хеш с Google Drive
+        const { data: { files: branchFiles } } = await drive.files.list({
+            q: `name=\'${currentBranch}\' and \'${headsFolderId}\' in parents and trashed=false`,
+            fields: 'files(id, name)',
+        });
 
-            if (status.startsWith('D')) {
-                deletedFiles.push(parts[1]);
-            } else if (status.startsWith('R')) {
-                deletedFiles.push(parts[1]); // old path
-                const newFile = parts[2]; // new path
-                const sourcePath = path.join(workspaceRoot, newFile);
-                const destPath = path.join(commitDir, newFile);
-                await fs.mkdir(path.dirname(destPath), { recursive: true });
-                await fs.copyFile(sourcePath, destPath);
-            } else { // A, M, C
+        let lastRemoteHash = null;
+        if (branchFiles.length > 0) {
+            const { data: fileContent } = await drive.files.get({ fileId: branchFiles[0].id, alt: 'media' });
+            lastRemoteHash = fileContent.trim();
+        }
+
+        const lastLocalHash = context.workspaceState.get(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, {})[currentBranch];
+
+        if (lastRemoteHash && lastRemoteHash !== lastLocalHash) {
+            vscode.window.showErrorMessage('Remote history has diverged. Please pull changes first.');
+            return;
+        }
+
+        const command = `git -c core.quotepath=false log ${lastLocalHash || '--all'} --pretty=format:"%H %aI %s" --reverse`;
+        const { stdout } = await runCommand(command, workspaceRoot);
+        if (!stdout) {
+            vscode.window.showInformationMessage('No new commits to push.');
+            return;
+        }
+        const commits = stdout.trim().split('\n').filter(Boolean).map(line => {
+            const [hash, date, ...messageParts] = line.split(' ');
+            const message = messageParts.join(' ');
+            return { hash, date, message };
+        });
+
+        for (const commit of commits) {
+            const tempDir = path.join(workspaceRoot, '.upload-temp');
+            await fs.mkdir(tempDir, { recursive: true });
+            const archivePath = path.join(tempDir, `${commit.hash}.zip`);
+
+            const { stdout: files } = await runCommand(`git -c core.quotepath=false show --name-status --pretty="" ${commit.hash}`, workspaceRoot);
+            const changedFilesWithStatus = files.trim().split('\n').filter(Boolean);
+
+            const output = fsSync.createWriteStream(archivePath);
+            const archive = archiver('zip', { zlib: { level: 9 } });
+            archive.pipe(output);
+
+            for (const line of changedFilesWithStatus) {
+                const parts = line.split('\t');
+                const status = parts[0];
                 const file = parts[1];
-                const sourcePath = path.join(workspaceRoot, file);
-                const destPath = path.join(commitDir, file);
-                await fs.mkdir(path.dirname(destPath), { recursive: true });
-                await fs.copyFile(sourcePath, destPath);
+
+                if (status.startsWith('A') || status.startsWith('M')) {
+                    archive.file(path.join(workspaceRoot, file), { name: file });
+                } else if (status.startsWith('D')) {
+                    // Флаг удаления можно хранить в архиве, если потребуется
+                } else if (status.startsWith('R')) {
+                    // Обработка переименований
+                }
             }
+            await archive.finalize();
+
+            await uploadToGoogleDrive(context, archivePath, objectsFolderId, `${commit.hash}.zip`);
+            await fs.rm(tempDir, { recursive: true, force: true });
         }
 
-        if (deletedFiles.length > 0) {
-            const deletedFilePath = path.join(commitDir, 'deleted.txt');
-            await fs.writeFile(deletedFilePath, deletedFiles.join('\n'));
+        const { stdout: newHeadHash } = await runCommand('git rev-parse HEAD', workspaceRoot);
+
+        if (branchFiles.length > 0) {
+            await drive.files.update({
+                fileId: branchFiles[0].id,
+                media: {
+                    mimeType: 'text/plain',
+                    body: newHeadHash.trim(),
+                },
+            });
+        } else {
+            await drive.files.create({
+                resource: {
+                    name: currentBranch,
+                    parents: [headsFolderId],
+                },
+                media: {
+                    mimeType: 'text/plain',
+                    body: newHeadHash.trim(),
+                },
+            });
         }
-        logContent += `${commit.hash} ${commit.date} ${commit.message}\n`;
+
+        const allHashes = context.workspaceState.get(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, {});
+        allHashes[currentBranch] = newHeadHash.trim();
+        await context.workspaceState.update(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, allHashes);
+
+        vscode.window.showInformationMessage(`Successfully pushed ${commits.length} commits to branch \'${currentBranch}\'.`);
+
+    } catch (error) {
+        vscode.window.showErrorMessage(`Push failed: ${error.message}`);
     }
-
-    await fs.writeFile(logFilePath, logContent);
-
-    const archiveName = `${path.basename(workspaceRoot)}_${moment().format('YYYYMMDDHHmmss')}.zip`;
-    const archivePath = path.join(workspaceRoot, archiveName);
-
-    await createArchiveFromFolder(tempDir, archivePath);
-    await uploadToGoogleDrive(context, archivePath);
-
-    const { stdout: newHeadHash } = await runCommand('git rev-parse HEAD', workspaceRoot);
-    allHashes[currentBranch] = newHeadHash.trim();
-    await context.workspaceState.update(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, allHashes);
-    await fs.rm(tempDir, { recursive: true, force: true });
-
-    vscode.window.showInformationMessage(`Successfully created and uploaded incremental archive for branch '${currentBranch}'.`);
 }
 
 async function createAndUploadFullArchive(workspaceRoot, files, currentBranch) {
@@ -358,7 +474,7 @@ async function createAndUploadFullArchive(workspaceRoot, files, currentBranch) {
 
 
 // --- Подпрограмма: "Загрузка изменений" ---
-async function downloadChanges(context) {
+async function pullCommits(context) {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders) {
         vscode.window.showErrorMessage('No workspace folder is open.');
@@ -373,132 +489,111 @@ async function downloadChanges(context) {
         return;
     }
 
-    const { data } = await drive.files.list({
-        q: "mimeType='application/zip' and trashed = false",
-        fields: 'files(id, name)',
-        orderBy: 'createdTime desc'
-    });
-
-    const files = data.files;
-    if (files.length === 0) {
-        vscode.window.showInformationMessage('No archives found on Google Drive.');
-        return;
-    }
-
-    const selectedFile = await vscode.window.showQuickPick(files.map(f => ({ label: f.name, description: f.id })), {
-        placeHolder: 'Select an archive to download'
-    });
-
-    if (!selectedFile) {
-        return;
-    }
-
-    const fileId = selectedFile.description;
-    const archivePath = path.join(workspaceRoot, selectedFile.label);
-
-    const dest = fsSync.createWriteStream(archivePath);
-    const { data: fileStream } = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
-
-    await new Promise((resolve, reject) => {
-        fileStream.on('end', resolve);
-        fileStream.on('error', reject);
-        fileStream.pipe(dest);
-    });
-
-    const { stdout: status } = await runCommand('git status --porcelain', workspaceRoot);
-    if (status.trim()) {
-        vscode.window.showErrorMessage('Your working directory is not clean. Please commit or stash your changes before downloading.');
-        return;
-    }
-    
-    const tempDir = path.join(workspaceRoot, '.download-temp');
-    await fs.mkdir(tempDir, { recursive: true });
+    const projectName = path.basename(workspaceRoot);
+    const gdriveGitDir = `.gdrive-git/${projectName}`;
 
     try {
-        // Распаковываем архив
-        await fsSync.createReadStream(archivePath).pipe(unzipper.Extract({ path: tempDir })).promise();
+        // Получаем ID папки проекта
+        const { data: { files: projectFolders } } = await drive.files.list({
+            q: `name=\'${gdriveGitDir}\' and mimeType=\'application/vnd.google-apps.folder\' and trashed=false`,
+            fields: 'files(id)',
+        });
 
-        const logPath = path.join(tempDir, 'commits.log');
-        
-        // Проверяем, есть ли commits.log для инкрементного обновления
-        if (fsSync.existsSync(logPath)) {
-            vscode.window.showInformationMessage('Found commits.log, starting incremental download.');
-            const logContent = await fs.readFile(logPath, 'utf-8');
-            const logLines = logContent.trim().split('\n');
-            const branchLine = logLines.find(line => line.startsWith('branch:'));
-            const archiveBranch = branchLine ? branchLine.split(':')[1].trim() : null;
+        if (projectFolders.length === 0) {
+            vscode.window.showErrorMessage(`Google Drive remote for project \'${projectName}\' not found. Please run initial upload first.`);
+            return;
+        }
+        const projectFolderId = projectFolders[0].id;
 
-            if (archiveBranch && archiveBranch !== currentBranch) {
-                vscode.window.showErrorMessage(`Archive is for branch '${archiveBranch}' but you are on branch '${currentBranch}'. Please switch branches and try again.`);
-                return;
-            }
+        // Получаем ID папки heads
+        const { data: { files: refsFolders } } = await drive.files.list({
+            q: `name=\'refs\' and mimeType=\'application/vnd.google-apps.folder\' and \'${projectFolderId}\' in parents and trashed=false`,
+            fields: 'files(id)',
+        });
+        const { data: { files: headsFolders } } = await drive.files.list({
+            q: `name=\'heads\' and mimeType=\'application/vnd.google-apps.folder\' and \'${refsFolders[0].id}\' in parents and trashed=false`,
+            fields: 'files(id)',
+        });
+        const headsFolderId = headsFolders[0].id;
 
-            const commitsToApply = logLines.filter(line => !line.startsWith('branch:')).map(line => {
-                const [hash, date, ...messageParts] = line.split(' ');
-                const message = messageParts.join(' ');
-                return { hash, date, message };
-            });
+        // Получаем ID папки objects
+        const { data: { files: objectsFolders } } = await drive.files.list({
+            q: `name=\'objects\' and mimeType=\'application/vnd.google-apps.folder\' and \'${projectFolderId}\' in parents and trashed=false`,
+            fields: 'files(id)',
+        });
+        const objectsFolderId = objectsFolders[0].id;
 
-            for (const commit of commitsToApply) {
-                const commitDir = path.join(tempDir, commit.hash);
-                const deletedFilePath = path.join(commitDir, 'deleted.txt');
+        // Получаем последний хеш с Google Drive
+        const { data: { files: branchFiles } } = await drive.files.list({
+            q: `name=\'${currentBranch}\' and \'${headsFolderId}\' in parents and trashed=false`,
+            fields: 'files(id, name)',
+        });
 
-                if (fsSync.existsSync(deletedFilePath)) {
-                    const deletedFilesContent = await fs.readFile(deletedFilePath, 'utf-8');
-                    const deletedFiles = deletedFilesContent.trim().split('\n').filter(Boolean);
-                    if (deletedFiles.length > 0) {
-                        const filesToRemove = [];
-                        for (const file of deletedFiles) {
-                            if (fsSync.existsSync(path.join(workspaceRoot, file))) {
-                                filesToRemove.push(`"${file.replace(/\\/g, '/')}"`);
-                            } else {
-                                vscode.window.showWarningMessage(`File scheduled for deletion not found, skipping: ${file}`);
-                            }
-                        }
-                        if (filesToRemove.length > 0) {
-                            await runCommand(`git rm -- ${filesToRemove.join(' ')}`, workspaceRoot);
-                        }
-                    }
-                }
-
-                // Копируем файлы из папки коммита в рабочую директорию, исключая deleted.txt
-                await copyRecursive(commitDir, workspaceRoot, ['deleted.txt']);
-
-                // Получаем список всех файлов, которые были в этом коммите (кроме deleted.txt)
-                const filesToCommit = (await getAllFilesRecursive(commitDir)).filter(f => f !== 'deleted.txt');
-
-                // Добавляем в индекс только измененные/новые файлы
-                if (filesToCommit.length > 0) {
-                    const filesToAdd = filesToCommit.map(f => `"${f.replace(/\\/g, '/')}"`).join(' ');
-                    await runCommand(`git add -- ${filesToAdd}`, workspaceRoot);
-                }
-
-                // Экранируем кавычки в сообщении коммита
-                const escapedMessage = commit.message.replace(/`/g, '\`').replace(/"/g, '\"');
-                //const escapedMessage = commit.message;
-                await runCommand(`git commit --allow-empty -m "${escapedMessage}" --date="${commit.date}"`, workspaceRoot);
-            }
-			
-			if (commitsToApply.length > 0) {
-                const lastAppliedCommitHash = commitsToApply[commitsToApply.length - 1].hash;
-                const allHashes = context.workspaceState.get(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, {});
-                allHashes[currentBranch] = lastAppliedCommitHash;
-                await context.workspaceState.update(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, allHashes);
-                vscode.window.showInformationMessage(`${commitsToApply.length} commits have been successfully applied to branch '${currentBranch}'.`);
-            } else {
-                vscode.window.showInformationMessage('No new commits were applied.');
-            }
-
-        } else {
-            // Полное восстановление
-            await copyRecursive(tempDir, workspaceRoot);
-            vscode.window.showInformationMessage('Project has been fully restored from the archive. Please review and commit the changes.');
+        if (branchFiles.length === 0) {
+            vscode.window.showInformationMessage('No remote commits to pull.');
+            return;
         }
 
-    } finally {
-        // Очистка
+        const { data: fileContent } = await drive.files.get({ fileId: branchFiles[0].id, alt: 'media' });
+        const lastRemoteHash = fileContent.trim();
+        const lastLocalHash = context.workspaceState.get(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, {})[currentBranch];
+
+        if (lastRemoteHash === lastLocalHash) {
+            vscode.window.showInformationMessage('Already up-to-date.');
+            return;
+        }
+
+        // Скачиваем недостающие коммиты
+        const { stdout: missingCommits } = await runCommand(`git -c core.quotepath=false log ${lastRemoteHash}..${lastLocalHash} --pretty=format:"%H"`, workspaceRoot);
+        const missingCommitHashes = missingCommits.trim().split('\n').filter(Boolean);
+
+        const tempDir = path.join(workspaceRoot, '.download-temp');
+        await fs.mkdir(tempDir, { recursive: true });
+
+        for (const commitHash of missingCommitHashes) {
+            const { data: { files } } = await drive.files.list({
+                q: `name=\'${commitHash}.zip\' and \'${objectsFolderId}\' in parents and trashed=false`,
+                fields: 'files(id)',
+            });
+
+            if (files.length > 0) {
+                const fileId = files[0].id;
+                const archivePath = path.join(tempDir, `${commitHash}.zip`);
+                const dest = fsSync.createWriteStream(archivePath);
+                const { data: fileStream } = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+
+                await new Promise((resolve, reject) => {
+                    fileStream.on('end', resolve);
+                    fileStream.on('error', reject);
+                    fileStream.pipe(dest);
+                });
+
+                await fsSync.createReadStream(archivePath).pipe(unzipper.Extract({ path: workspaceRoot })).promise();
+                await fs.unlink(archivePath);
+            }
+        }
+
         await fs.rm(tempDir, { recursive: true, force: true });
-        await fs.unlink(archivePath);
+
+        // Мержим изменения
+        try {
+            await runCommand(`git merge ${lastRemoteHash}`, workspaceRoot);
+            vscode.window.showInformationMessage('Successfully pulled and merged changes.');
+        } catch (error) {
+            if (error.message.includes('conflict')) {
+                vscode.window.showWarningMessage('Merge conflict detected. Please resolve conflicts and commit.');
+            } else {
+                throw error;
+            }
+        }
+
+        const { stdout: newHeadHash } = await runCommand('git rev-parse HEAD', workspaceRoot);
+        const allHashes = context.workspaceState.get(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, {});
+        allHashes[currentBranch] = newHeadHash.trim();
+        await context.workspaceState.update(LAST_UPLOAD_HASHES_BY_BRANCH_KEY, allHashes);
+
+    } catch (error) {
+        vscode.window.showErrorMessage(`Pull failed: ${error.message}`);
     }
 }
 
@@ -543,14 +638,12 @@ async function getAuthenticatedClient(context) {
     return google.drive({ version: 'v3', auth: oauth2Client });
 }
 
-async function uploadToGoogleDrive(context, archivePath) {
+async function uploadToGoogleDrive(context, archivePath, parentFolderId, fileName) {
     const drive = await getAuthenticatedClient(context);
     if (!drive) {
         vscode.window.showErrorMessage('Authentication with Google Drive is required.');
         return;
     }
-
-    const archiveName = path.basename(archivePath);
 
     const media = {
         mimeType: 'application/zip',
@@ -558,7 +651,8 @@ async function uploadToGoogleDrive(context, archivePath) {
     };
 
     const fileMetadata = {
-        name: archiveName,
+        name: fileName,
+        parents: [parentFolderId]
     };
 
     try {
