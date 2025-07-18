@@ -2,7 +2,7 @@
   "name": "changegittogoogledrive-extension",
   "displayName": "ChangeGitToGoogleDrive Extension",
   "description": "An extension to archive and upload workspace files to Google Drive.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "user",
   "repository": {
     "type": "git",
@@ -20,7 +20,8 @@
     "onCommand:changegittogoogledrive-extension.initialUpload",
     "onCommand:changegittogoogledrive-extension.sync",
     "onCommand:changegittogoogledrive-extension.installGitHooks",
-    "onCommand:changegittogoogledrive-extension.cloneFromGoogleDrive"
+    "onCommand:changegittogoogledrive-extension.cloneFromGoogleDrive",
+    "onCommand:changegittogoogledrive-extension.manageSyncHash"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -53,6 +54,11 @@
       {
         "command": "changegittogoogledrive-extension.installGitHooks",
         "title": "Установить Git Hooks",
+        "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.manageSyncHash",
+        "title": "Показать/изменить хеш синхронизации",
         "category": "Git-To-Google-Drive"
       }
     ]

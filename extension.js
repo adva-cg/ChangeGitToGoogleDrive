@@ -22,7 +22,8 @@ function activate(context) {
         vscode.commands.registerCommand('changegittogoogledrive-extension.initialUpload', () => initialUpload(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.sync', () => sync(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.installGitHooks', () => installGitHooks(context)),
-        vscode.commands.registerCommand('changegittogoogledrive-extension.cloneFromGoogleDrive', () => cloneFromGoogleDrive(context))
+        vscode.commands.registerCommand('changegittogoogledrive-extension.cloneFromGoogleDrive', () => cloneFromGoogleDrive(context)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.manageSyncHash', () => manageSyncHash(context))
     );
 
     // --- РЕГИСТРАЦИЯ ОБРАБОТЧИКА URI ДЛЯ GIT HOOKS ---
@@ -216,23 +217,9 @@ async function installGitHooks(context) {
     const postCommitHookPath = path.join(hooksDir, 'post-commit');
     const extensionId = 'user.changegittogoogledrive-extension'; // Замените на ваш реальный ID
 
-    const preCommitScript = `#!/bin/sh
-echo "----------------------------------------------------------------"
-echo "REMINDER: Have you synced with Google Drive recently?"
-echo "Run 'Sync with Google Drive' command to pull latest changes."
-echo "----------------------------------------------------------------"
-`;
+    const preCommitScript = `#!/bin/sh\necho "----------------------------------------------------------------"\necho "REMINDER: Have you synced with Google Drive recently?"\necho "Run 'Sync with Google Drive' command to pull latest changes."\necho "----------------------------------------------------------------"\n`;
 
-    const postCommitScript = `#!/bin/sh
-# Hook to trigger VS Code sync after commit
-
-# Check if VS Code command line tool is available
-if command -v code >/dev/null 2>&1; then
-  code --open-url "vscode://${extensionId}/sync"
-else
-  echo "VS Code command 'code' not found in PATH. Cannot trigger sync."
-fi
-`;
+    const postCommitScript = `#!/bin/sh\n# Hook to trigger VS Code sync after commit\n\n# Check if VS Code command line tool is available\nif command -v code >/dev/null 2>&1; then\n  code --open-url "vscode://${extensionId}/sync"\nelse\n  echo "VS Code command 'code' not found in PATH. Cannot trigger sync."\nfi\n`;
 
     try {
         await fs.mkdir(hooksDir, { recursive: true });
@@ -393,6 +380,96 @@ async function cloneFromGoogleDrive(context) {
             await fs.rm(tempDir, { recursive: true, force: true });
         }
     }
+}
+
+async function manageSyncHash(context) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
+
+    const currentBranch = await getCurrentBranch(workspaceRoot);
+    if (!currentBranch) return;
+
+    const hashKey = `${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`;
+    const lastPushedHash = context.workspaceState.get(hashKey);
+
+    const currentHashMessage = lastPushedHash
+        ? `Текущий хеш синхронизации для ветки '${currentBranch}': ${lastPushedHash.substring(0, 7)}`
+        : `Для ветки '${currentBranch}' не задан хеш синхронизации. Следующая отправка будет полной.`;
+
+    vscode.window.showInformationMessage(currentHashMessage);
+
+    const choice = await vscode.window.showQuickPick([
+        { label: "Установить из последних коммитов", description: "Выбрать из 10 последних коммитов", action: "select" },
+        { label: "Ввести хеш вручную", description: "Указать конкретный хеш коммита", action: "manual" },
+        { label: "Сбросить хеш синхронизации", description: "Вызвать полную повторную выгрузку для этой ветки", action: "reset" },
+        { label: "Отмена", isCloseAffordance: true, action: "cancel" }
+    ], {
+        placeHolder: "Как вы хотите изменить хеш синхронизации?"
+    });
+
+    if (!choice || choice.action === "cancel") {
+        vscode.window.showInformationMessage("Операция отменена.");
+        return;
+    }
+
+    let newHash = null; // null means cancellation
+
+    switch (choice.action) {
+        case "select":
+            newHash = await selectCommitHash(workspaceRoot);
+            break;
+        case "manual":
+            newHash = await inputCommitHash();
+            break;
+        case "reset":
+            newHash = undefined; // undefined means reset
+            break;
+    }
+
+    if (newHash === null) {
+        vscode.window.showInformationMessage("Операция отменена.");
+        return;
+    }
+
+    await context.workspaceState.update(hashKey, newHash);
+
+    if (newHash === undefined) {
+        vscode.window.showInformationMessage(`Хеш синхронизации для ветки '${currentBranch}' был сброшен.`);
+    } else {
+        vscode.window.showInformationMessage(`Хеш синхронизации для ветки '${currentBranch}' обновлен на: ${newHash.substring(0, 7)}`);
+    }
+}
+
+async function selectCommitHash(workspaceRoot) {
+    try {
+        const { stdout } = await runCommand('git log -10 --pretty=format:"%H|%s"', workspaceRoot);
+        if (!stdout.trim()) {
+            vscode.window.showErrorMessage("В этом репозитории еще нет коммитов.");
+            return null;
+        }
+        const commits = stdout.trim().split('\n').map(line => {
+            const [hash, subject] = line.slice(1, -1).split('|');
+            return { label: subject, description: hash.substring(0, 7), hash: hash };
+        });
+
+        const selectedCommit = await vscode.window.showQuickPick(commits, {
+            placeHolder: "Выберите коммит, который будет новой точкой синхронизации"
+        });
+
+        return selectedCommit ? selectedCommit.hash : null;
+    } catch (error) {
+        vscode.window.showErrorMessage(`Не удалось получить последние коммиты: ${error.message}`);
+        return null;
+    }
+}
+
+async function inputCommitHash() {
+    const newHash = await vscode.window.showInputBox({
+        prompt: "Введите полный хеш коммита",
+        placeHolder: "например, a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        validateInput: value => /^[a-f0-9]{40}$/.test(value) ? null : "Неверный формат хеша. Укажите полный 40-символьный SHA-1 хеш."
+    });
+    return newHash === undefined ? null : newHash; // Convert cancel (undefined) to null
 }
 
 // --- АУТЕНТИФИКАЦИЯ И УТИЛИТЫ GOOGLE DRIVE ---
