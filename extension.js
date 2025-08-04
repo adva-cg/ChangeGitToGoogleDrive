@@ -156,33 +156,37 @@ async function uploadUntrackedFiles(context, silent = false) {
     if (!drive) return;
 
     if (!silent) {
-        vscode.window.showInformationMessage('Uploading untracked files to Google Drive...');
+        vscode.window.showInformationMessage('Uploading specified files to Google Drive...');
     }
 
     try {
         const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot);
         if (!untrackedFolderId) return;
 
-        const { stdout: untrackedFilesStr } = await runCommand('git ls-files --others --exclude-standard', workspaceRoot);
-        let untrackedFiles = untrackedFilesStr.trim().split(/\r\n|\n/).filter(f => f);
-
         const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
-        const excludePatterns = config.get('exclude', []);
-        if (excludePatterns.length > 0) {
-            const minimatch = require('minimatch');
-            untrackedFiles = untrackedFiles.filter(file =>
-                !excludePatterns.some(pattern => minimatch(file, pattern, { matchBase: true }))
-            );
+        const includePatterns = config.get('include', []);
+
+        if (includePatterns.length === 0) {
+            if (!silent) vscode.window.showInformationMessage('No include patterns are configured. Nothing to upload.');
+            return;
         }
 
-        if (untrackedFiles.length === 0) {
-            if (!silent) vscode.window.showInformationMessage('No untracked files to upload.');
+        const { stdout: allIgnoredFilesStr } = await runCommand('git ls-files --others --ignored --exclude-standard', workspaceRoot);
+        let allIgnoredFiles = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => f);
+
+        const minimatch = require('minimatch');
+        const filesToUpload = allIgnoredFiles.filter(file =>
+            includePatterns.some(pattern => minimatch(file, pattern, { matchBase: true }))
+        );
+
+        if (filesToUpload.length === 0) {
+            if (!silent) vscode.window.showInformationMessage('No files matched the include patterns. Nothing to upload.');
             return;
         }
 
         const machineId = context.globalState.get(MACHINE_ID_KEY);
 
-        for (const relativePath of untrackedFiles) {
+        for (const relativePath of filesToUpload) {
             const absolutePath = path.join(workspaceRoot, relativePath);
             try {
                 const remoteFile = await findRemoteFile(drive, untrackedFolderId, relativePath);
@@ -220,11 +224,11 @@ async function uploadUntrackedFiles(context, silent = false) {
         }
 
         if (!silent) {
-            vscode.window.showInformationMessage('Finished uploading untracked files.');
+            vscode.window.showInformationMessage('Finished uploading files.');
         }
 
     } catch (error) {
-        vscode.window.showErrorMessage(`Failed to upload untracked files: ${error.message}`);
+        vscode.window.showErrorMessage(`Failed to upload files: ${error.message}`);
     }
 }
 
@@ -888,9 +892,4 @@ async function getCurrentBranch(cwd) {
     }
 }
 
-function deactivate() {}
-
-module.exports = {
-    activate,
-    deactivate
-};
+function deactivate() {}module.exports = {    activate,    deactivate};

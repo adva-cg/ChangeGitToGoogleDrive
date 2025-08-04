@@ -77,10 +77,10 @@
     "configuration": {
       "title": "ChangeGitToGoogleDrive",
       "properties": {
-        "changegittogoogledrive-extension.untrackedFiles.exclude": {
+        "changegittogoogledrive-extension.untrackedFiles.include": {
           "type": "array",
           "default": [],
-          "description": "An array of glob patterns to exclude when uploading untracked files.",
+          "description": "An array of glob patterns to include when uploading untracked files.",
           "items": {
             "type": "string"
           }
