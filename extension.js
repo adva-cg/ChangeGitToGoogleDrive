@@ -16,11 +16,14 @@ const GOOGLE_DRIVE_TOKENS_KEY = 'googleDriveTokens';
 const LAST_PUSHED_HASH_KEY_PREFIX = 'lastPushedHash_'; // Prefix + branch name
 const MACHINE_ID_KEY = 'machineId';
 
+function escapeGdriveQueryParam(param) {
+    return param.replace(/\\/g, '/').replace(/'/g, "\\'");
+}
+
 function activate(context) {
     // --- ГЕНЕРАЦИЯ MACHINE ID ---
     let machineId = context.globalState.get(MACHINE_ID_KEY);
     if (!machineId) {
-        // Используем встроенный ID от VS Code, он достаточно уникален
         machineId = vscode.env.machineId;
         context.globalState.update(MACHINE_ID_KEY, machineId);
     }
@@ -55,7 +58,6 @@ function activate(context) {
     // --- АВТОМАТИЧЕСКАЯ СИНХРОНИЗАЦИЯ ПРИ ЗАПУСКЕ ---
     const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
     if (config.get('syncOnStartup')) {
-        // Запускаем в "тихом" режиме
         syncUntrackedFiles(context, true);
     }
 
@@ -71,9 +73,9 @@ function activate(context) {
                 const uploadConfig = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
                 if (uploadConfig.get('autoUpload')) {
                     console.log('Auto-uploading untracked files...');
-                    uploadUntrackedFiles(context, true); // true for silent mode
+                    uploadUntrackedFiles(context, true);
                 }
-            }, 60000); // 60-second delay
+            }, 60000);
         };
 
         watcher.onDidChange(debouncedUpload);
@@ -229,7 +231,7 @@ async function initialUpload(context) {
         if (!currentBranch) return;
 
         await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`, undefined);
-        vscode.window.showInformationMessage(`Статус синхронизации для ветки '${currentBranch}' сброшен. Начинаю новую выгрузку...`);
+        vscode.window.showInformationMessage(`Статус синхронизации для ветки '${currentBranch}': ${currentBranch} сброшен. Начинаю новую выгрузку...`);
 
         await pushCommits(context);
     } catch (error) {
@@ -322,8 +324,9 @@ async function pullCommits(context) {
         return;
     }
 
+    const q = `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle' and name contains '${escapeGdriveQueryParam(currentBranch)}--'`;
     const { data: { files: remoteBundles } } = await drive.files.list({
-        q: `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle' and name contains '${currentBranch}--'`,
+        q: q,
         fields: 'files(id, name, createdTime)',
         orderBy: 'createdTime',
     });
@@ -717,7 +720,8 @@ async function findOrCreateProjectFolders(drive, workspaceRoot) {
         rootFolderId = rootFolders[0].id;
     }
 
-    let { data: { files: projectFolders } } = await drive.files.list({ q: `name='${projectName}' and mimeType='application/vnd.google-apps.folder' and '${rootFolderId}' in parents and trashed=false`, fields: 'files(id)' });
+    const q = `name='${escapeGdriveQueryParam(projectName)}' and mimeType='application/vnd.google-apps.folder' and '${rootFolderId}' in parents and trashed=false`;
+    let { data: { files: projectFolders } } = await drive.files.list({ q: q, fields: 'files(id)' });
     let projectFolderId;
     if (projectFolders.length === 0) {
         const { data } = await drive.files.create({ resource: { name: projectName, mimeType: 'application/vnd.google-apps.folder', parents: [rootFolderId] }, fields: 'id' });
@@ -752,7 +756,8 @@ async function findOrCreateUntrackedFilesFolder(drive, workspaceRoot) {
         rootFolderId = rootFolders[0].id;
     }
 
-    let { data: { files: projectFolders } } = await drive.files.list({ q: `name='${projectName}' and mimeType='application/vnd.google-apps.folder' and '${rootFolderId}' in parents and trashed=false`, fields: 'files(id)' });
+    const q = `name='${escapeGdriveQueryParam(projectName)}' and mimeType='application/vnd.google-apps.folder' and '${rootFolderId}' in parents and trashed=false`;
+    let { data: { files: projectFolders } } = await drive.files.list({ q: q, fields: 'files(id)' });
     let projectFolderId;
     if (projectFolders.length === 0) {
         const { data } = await drive.files.create({ resource: { name: projectName, mimeType: 'application/vnd.google-apps.folder', parents: [rootFolderId] }, fields: 'id' });
@@ -821,7 +826,8 @@ function getFileMd5(filePath) {
 }
 
 async function findRemoteFile(drive, folderId, fileName) {
-    const q = `'${folderId}' in parents and name = '${fileName.replace(/\/g, '/')}' and trashed=false`;
+    const escapedFileName = escapeGdriveQueryParam(fileName);
+    const q = `'${folderId}' in parents and name = '${escapedFileName}' and trashed=false`;
     const res = await drive.files.list({
         q: q,
         fields: 'files(id, name, md5Checksum, appProperties)',
