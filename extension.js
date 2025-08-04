@@ -17,6 +17,7 @@ const LAST_PUSHED_HASH_KEY_PREFIX = 'lastPushedHash_'; // Prefix + branch name
 const MACHINE_ID_KEY = 'machineId';
 
 function escapeGdriveQueryParam(param) {
+    if (!param) return "";
     return param.replace(/\\/g, '/').replace(/'/g, "\\'");
 }
 
@@ -106,31 +107,35 @@ async function syncUntrackedFiles(context, silent = false) {
 
         for (const remoteFile of remoteFiles) {
             const localPath = path.join(workspaceRoot, remoteFile.name);
-            const fileExistsLocally = fsSync.existsSync(localPath);
+            try {
+                const fileExistsLocally = fsSync.existsSync(localPath);
 
-            if (fileExistsLocally) {
-                const localMd5 = await getFileMd5(localPath);
-                if (localMd5 !== remoteFile.md5Checksum) {
-                    const remoteMachineId = (remoteFile.appProperties && remoteFile.appProperties.machineId) ? remoteFile.appProperties.machineId : null;
-                    
-                    if (remoteMachineId !== machineId) {
-                        const choice = await vscode.window.showQuickPick(
-                            [
-                                { label: "Download from Google Drive", description: `Overwrite local file: ${remoteFile.name}`, action: "download" },
-                                { label: "Keep Local Version", description: "Ignore remote changes", action: "keep" },
-                            ],
-                            { placeHolder: `Conflict detected for ${remoteFile.name}. The remote file was modified by another machine. What would you like to do?`, ignoreFocusOut: true }
-                        );
+                if (fileExistsLocally) {
+                    const localMd5 = await getFileMd5(localPath);
+                    if (localMd5 !== remoteFile.md5Checksum) {
+                        const remoteMachineId = (remoteFile.appProperties && remoteFile.appProperties.machineId) ? remoteFile.appProperties.machineId : null;
+                        
+                        if (remoteMachineId !== machineId) {
+                            const choice = await vscode.window.showQuickPick(
+                                [
+                                    { label: "Download from Google Drive", description: `Overwrite local file: ${remoteFile.name}`, action: "download" },
+                                    { label: "Keep Local Version", description: "Ignore remote changes", action: "keep" },
+                                ],
+                                { placeHolder: `Conflict detected for ${remoteFile.name}. The remote file was modified by another machine. What would you like to do?`, ignoreFocusOut: true }
+                            );
 
-                        if (choice && choice.action === 'download') {
-                            await downloadFile(drive, remoteFile.id, localPath);
-                            if (!silent) vscode.window.showInformationMessage(`Downloaded: ${remoteFile.name}`);
+                            if (choice && choice.action === 'download') {
+                                await downloadFile(drive, remoteFile.id, localPath);
+                                if (!silent) vscode.window.showInformationMessage(`Downloaded: ${remoteFile.name}`);
+                            }
                         }
                     }
+                } else {
+                    await downloadFile(drive, remoteFile.id, localPath);
+                    if (!silent) vscode.window.showInformationMessage(`Downloaded new file: ${remoteFile.name}`);
                 }
-            } else {
-                await downloadFile(drive, remoteFile.id, localPath);
-                if (!silent) vscode.window.showInformationMessage(`Downloaded new file: ${remoteFile.name}`);
+            } catch (error) {
+                vscode.window.showErrorMessage(`Error processing file ${remoteFile.name}: ${error.message}`);
             }
         }
 
@@ -179,34 +184,38 @@ async function uploadUntrackedFiles(context, silent = false) {
 
         for (const relativePath of untrackedFiles) {
             const absolutePath = path.join(workspaceRoot, relativePath);
-            const remoteFile = await findRemoteFile(drive, untrackedFolderId, relativePath);
-            const localMd5 = await getFileMd5(absolutePath);
+            try {
+                const remoteFile = await findRemoteFile(drive, untrackedFolderId, relativePath);
+                const localMd5 = await getFileMd5(absolutePath);
 
-            if (remoteFile) {
-                if (localMd5 !== remoteFile.md5Checksum) {
-                    const remoteMachineId = (remoteFile.appProperties && remoteFile.appProperties.machineId) ? remoteFile.appProperties.machineId : null;
+                if (remoteFile) {
+                    if (localMd5 !== remoteFile.md5Checksum) {
+                        const remoteMachineId = (remoteFile.appProperties && remoteFile.appProperties.machineId) ? remoteFile.appProperties.machineId : null;
 
-                    if (remoteMachineId === machineId) {
-                        await updateFile(drive, remoteFile.id, absolutePath, machineId);
-                        if (!silent) vscode.window.showInformationMessage(`Updated: ${relativePath}`);
-                    } else {
-                        const choice = await vscode.window.showQuickPick(
-                            [
-                                { label: "Upload & Overwrite", description: `Replace remote file: ${relativePath}`, action: "upload" },
-                                { label: "Skip", description: "Do not upload this file", action: "skip" },
-                            ],
-                            { placeHolder: `Conflict detected for ${relativePath}. The remote file was modified by another machine. What would you like to do?`, ignoreFocusOut: true }
-                        );
-
-                        if (choice && choice.action === 'upload') {
+                        if (remoteMachineId === machineId) {
                             await updateFile(drive, remoteFile.id, absolutePath, machineId);
-                            if (!silent) vscode.window.showInformationMessage(`Uploaded & Overwrote: ${relativePath}`);
+                            if (!silent) vscode.window.showInformationMessage(`Updated: ${relativePath}`);
+                        } else {
+                            const choice = await vscode.window.showQuickPick(
+                                [
+                                    { label: "Upload & Overwrite", description: `Replace remote file: ${relativePath}`, action: "upload" },
+                                    { label: "Skip", description: "Do not upload this file", action: "skip" },
+                                ],
+                                { placeHolder: `Conflict detected for ${relativePath}. The remote file was modified by another machine. What would you like to do?`, ignoreFocusOut: true }
+                            );
+
+                            if (choice && choice.action === 'upload') {
+                                await updateFile(drive, remoteFile.id, absolutePath, machineId);
+                                if (!silent) vscode.window.showInformationMessage(`Uploaded & Overwrote: ${relativePath}`);
+                            }
                         }
                     }
+                } else {
+                    await createFile(drive, untrackedFolderId, absolutePath, relativePath, machineId);
+                    if (!silent) vscode.window.showInformationMessage(`Uploaded new file: ${relativePath}`);
                 }
-            } else {
-                await createFile(drive, untrackedFolderId, absolutePath, relativePath, machineId);
-                if (!silent) vscode.window.showInformationMessage(`Uploaded new file: ${relativePath}`);
+            } catch (error) {
+                vscode.window.showErrorMessage(`Error processing file ${relativePath}: ${error.message}`);
             }
         }
 
@@ -231,7 +240,7 @@ async function initialUpload(context) {
         if (!currentBranch) return;
 
         await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`, undefined);
-        vscode.window.showInformationMessage(`Статус синхронизации для ветки '${currentBranch}': ${currentBranch} сброшен. Начинаю новую выгрузку...`);
+        vscode.window.showInformationMessage(`Статус синхронизации для ветки '${currentBranch}' сброшен. Начинаю новую выгрузку...`);
 
         await pushCommits(context);
     } catch (error) {
@@ -353,28 +362,20 @@ async function pullCommits(context) {
 
     const tempDir = path.join(workspaceRoot, '.git', 'gdrive-temp-bundles');
     await fs.mkdir(tempDir, { recursive: true });
-    let fetchedSomething = false;
 
     try {
         for (const bundle of bundlesToDownload) {
             const tempBundlePath = path.join(tempDir, bundle.name);
             await downloadFile(drive, bundle.id, tempBundlePath);
             await runCommand(`git fetch \"${tempBundlePath}\"`, workspaceRoot);
-            fetchedSomething = true;
             vscode.window.showInformationMessage(`Fetched commit ${bundle.name.split('--')[1]?.substring(0, 7)}.`);
         }
 
-        if (fetchedSomething) {
-            try {
-                await runCommand(`git merge --ff-only FETCH_HEAD`, workspaceRoot);
-                vscode.window.showInformationMessage('Successfully merged remote changes.');
-            } catch (error) {
-                vscode.window.showInformationMessage('New commits have been fetched. Please merge or rebase your branch as needed.');
-            }
-        }
+        await runCommand(`git merge --ff-only FETCH_HEAD`, workspaceRoot);
+        vscode.window.showInformationMessage('Successfully merged remote changes.');
 
     } catch (error) {
-        vscode.window.showErrorMessage(`Pull failed: ${error.message}`);
+        vscode.window.showInformationMessage('New commits have been fetched. Please merge or rebase your branch as needed.');
     } finally {
         await fs.rm(tempDir, { recursive: true, force: true });
     }
@@ -836,7 +837,7 @@ async function findRemoteFile(drive, folderId, fileName) {
 }
 
 async function createFile(drive, folderId, filePath, relativePath, machineId) {
-    const fileName = relativePath.replace(/\/g, '/');
+    const fileName = relativePath.replace(/\\/g, '/');
     const media = { mimeType: 'application/octet-stream', body: fsSync.createReadStream(filePath) };
     await drive.files.create({
         resource: { name: fileName, parents: [folderId], appProperties: { machineId } },
