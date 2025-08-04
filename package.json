@@ -2,7 +2,7 @@
   "name": "changegittogoogledrive-extension",
   "displayName": "ChangeGitToGoogleDrive Extension",
   "description": "An extension to archive and upload workspace files to Google Drive.",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "publisher": "VitalyAdadurov",
   "repository": {
     "type": "git",
@@ -21,7 +21,9 @@
     "onCommand:changegittogoogledrive-extension.sync",
     "onCommand:changegittogoogledrive-extension.installGitHooks",
     "onCommand:changegittogoogledrive-extension.cloneFromGoogleDrive",
-    "onCommand:changegittogoogledrive-extension.manageSyncHash"
+    "onCommand:changegittogoogledrive-extension.manageSyncHash",
+    "onCommand:changegittogoogledrive-extension.uploadUntrackedFiles",
+    "onCommand:changegittogoogledrive-extension.syncUntrackedFiles"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -60,8 +62,41 @@
         "command": "changegittogoogledrive-extension.manageSyncHash",
         "title": "Показать/изменить хеш синхронизации",
         "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.uploadUntrackedFiles",
+        "title": "Выгрузить неотслеживаемые файлы на Google Drive",
+        "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.syncUntrackedFiles",
+        "title": "Синхронизировать неотслеживаемые файлы с Google Drive",
+        "category": "Git-To-Google-Drive"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "ChangeGitToGoogleDrive",
+      "properties": {
+        "changegittogoogledrive-extension.untrackedFiles.exclude": {
+          "type": "array",
+          "default": [],
+          "description": "An array of glob patterns to exclude when uploading untracked files.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "changegittogoogledrive-extension.untrackedFiles.autoUpload": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable automatic uploading of untracked files on change."
+        },
+        "changegittogoogledrive-extension.untrackedFiles.syncOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable automatic syncing of untracked files on startup."
+        }
+      }
+    }
   },
   "devDependencies": {
     "@types/glob": "^8.1.0",
@@ -73,6 +108,7 @@
     "mocha": "^10.2.0"
   },
   "dependencies": {
-    "googleapis": "^153.0.0"
+    "googleapis": "^153.0.0",
+    "minimatch": "^10.0.3"
   }
 }
