@@ -7,6 +7,7 @@ const { google } = require('googleapis');
 const url = require('url');
 const http = require('http');
 const crypto = require('crypto');
+const { minimatch } = require('minimatch');
 
 const REDIRECT_URI = 'http://localhost:8080/oauth2callback';
 
@@ -174,7 +175,6 @@ async function uploadUntrackedFiles(context, silent = false) {
         const { stdout: allIgnoredFilesStr } = await runCommand('git ls-files --others --ignored --exclude-standard', workspaceRoot);
         let allIgnoredFiles = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => f);
 
-        const minimatch = require('minimatch');
         const filesToUpload = allIgnoredFiles.filter(file =>
             includePatterns.some(pattern => minimatch(file, pattern, { matchBase: true }))
         );
