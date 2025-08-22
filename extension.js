@@ -8,6 +8,7 @@ const url = require('url');
 const http = require('http');
 const crypto = require('crypto');
 const { minimatch } = require('minimatch');
+const os = require('os');
 
 const REDIRECT_URI = 'http://localhost:8080/oauth2callback';
 
@@ -117,18 +118,50 @@ async function syncUntrackedFiles(context, silent = false) {
                         const remoteMachineId = (remoteFile.appProperties && remoteFile.appProperties.machineId) ? remoteFile.appProperties.machineId : null;
                         
                         if (remoteMachineId !== machineId) {
-                            const choice = await vscode.window.showQuickPick(
-                                [
-                                    { label: "Download from Google Drive", description: `Overwrite local file: ${remoteFile.name}`, action: "download" },
-                                    { label: "Keep Local Version", description: "Ignore remote changes", action: "keep" },
-                                ],
-                                { placeHolder: `Conflict detected for ${remoteFile.name}. The remote file was modified by another machine. What would you like to do?`, ignoreFocusOut: true }
-                            );
+                            let choice;
+                            while (true) {
+                                const options = [
+                                    { label: "Загрузить с Google Drive (Перезаписать локальный)", description: `Заменит ваш локальный файл: ${remoteFile.name}`, action: "download" },
+                                    { label: "Оставить локальную версию (Пропустить)", description: "Проигнорировать удаленные изменения", action: "keep" },
+                                    { label: "Выгрузить мою версию (Перезаписать удаленный)", description: "Заменит файл на Google Drive вашей версией", action: "upload" },
+                                    { label: "Сравнить изменения", description: "Показать различия между удаленным и локальным файлами", action: "compare" }
+                                ];
 
-                            if (choice && choice.action === 'download') {
-                                await downloadFile(drive, remoteFile.id, localPath);
-                                if (!silent) vscode.window.showInformationMessage(`Downloaded: ${remoteFile.name}`);
+                                choice = await vscode.window.showQuickPick(options, {
+                                    placeHolder: `Конфликт: файл ${remoteFile.name} был изменен на другой машине. Что сделать?`,
+                                    ignoreFocusOut: true
+                                });
+
+                                if (choice && choice.action === 'compare') {
+                                    const tempRemotePath = path.join(os.tmpdir(), `gdrive-remote-${Date.now()}-${remoteFile.name}`);
+                                    try {
+                                        await downloadFile(drive, remoteFile.id, tempRemotePath);
+                                        const remoteUri = vscode.Uri.file(tempRemotePath);
+                                        const localUri = vscode.Uri.file(localPath);
+                                        await vscode.commands.executeCommand('vscode.diff', remoteUri, localUri, `Сравнение: ${remoteFile.name} (Google Drive) ↔ (Локальный)`);
+                                    } catch (e) {
+                                        vscode.window.showErrorMessage(`Не удалось сравнить файлы: ${e.message}`);
+                                    } finally {
+                                        if (fsSync.existsSync(tempRemotePath)) {
+                                            await fs.unlink(tempRemotePath);
+                                        }
+                                    }
+                                    // После сравнения, цикл продолжится и покажет меню снова
+                                } else {
+                                    break; // Выход из цикла, если выбрано действие или закрыто меню
+                                }
                             }
+
+                            if (!choice) continue; // Пропустить, если пользователь закрыл меню
+
+                            if (choice.action === 'download') {
+                                await downloadFile(drive, remoteFile.id, localPath);
+                                if (!silent) vscode.window.showInformationMessage(`Загружен: ${remoteFile.name}`);
+                            } else if (choice.action === 'upload') {
+                                await updateFile(drive, remoteFile.id, localPath, machineId);
+                                if (!silent) vscode.window.showInformationMessage(`Выгружен: ${remoteFile.name}`);
+                            }
+                            // Для 'keep' ничего делать не нужно
                         }
                     }
                 } else {
@@ -200,18 +233,49 @@ async function uploadUntrackedFiles(context, silent = false) {
                             await updateFile(drive, remoteFile.id, absolutePath, machineId);
                             if (!silent) vscode.window.showInformationMessage(`Updated: ${relativePath}`);
                         } else {
-                            const choice = await vscode.window.showQuickPick(
-                                [
-                                    { label: "Upload & Overwrite", description: `Replace remote file: ${relativePath}`, action: "upload" },
-                                    { label: "Skip", description: "Do not upload this file", action: "skip" },
-                                ],
-                                { placeHolder: `Conflict detected for ${relativePath}. The remote file was modified by another machine. What would you like to do?`, ignoreFocusOut: true }
-                            );
+                            let choice;
+                            while (true) {
+                                const options = [
+                                    { label: "Выгрузить мою версию (Перезаписать удаленный)", description: `Заменит удаленный файл: ${relativePath}`, action: "upload" },
+                                    { label: "Пропустить выгрузку", description: "Не выгружать этот файл", action: "skip" },
+                                    { label: "Загрузить удаленную версию (Перезаписать локальный)", description: "Заменит ваш локальный файл версией с Google Drive", action: "download" },
+                                    { label: "Сравнить изменения", description: "Показать различия между удаленным и локальным файлами", action: "compare" }
+                                ];
 
-                            if (choice && choice.action === 'upload') {
-                                await updateFile(drive, remoteFile.id, absolutePath, machineId);
-                                if (!silent) vscode.window.showInformationMessage(`Uploaded & Overwrote: ${relativePath}`);
+                                choice = await vscode.window.showQuickPick(options, {
+                                    placeHolder: `Конфликт: файл ${relativePath} на Google Drive был изменен. Что сделать?`,
+                                    ignoreFocusOut: true
+                                });
+
+                                if (choice && choice.action === 'compare') {
+                                    const tempRemotePath = path.join(os.tmpdir(), `gdrive-remote-${Date.now()}-${path.basename(relativePath)}`);
+                                    try {
+                                        await downloadFile(drive, remoteFile.id, tempRemotePath);
+                                        const remoteUri = vscode.Uri.file(tempRemotePath);
+                                        const localUri = vscode.Uri.file(absolutePath);
+                                        await vscode.commands.executeCommand('vscode.diff', remoteUri, localUri, `Сравнение: ${relativePath} (Google Drive) ↔ (Локальный)`);
+                                    } catch (e) {
+                                        vscode.window.showErrorMessage(`Не удалось сравнить файлы: ${e.message}`);
+                                    } finally {
+                                        if (fsSync.existsSync(tempRemotePath)) {
+                                            await fs.unlink(tempRemotePath);
+                                        }
+                                    }
+                                } else {
+                                    break;
+                                }
                             }
+
+                            if (!choice) continue;
+
+                            if (choice.action === 'upload') {
+                                await updateFile(drive, remoteFile.id, absolutePath, machineId);
+                                if (!silent) vscode.window.showInformationMessage(`Выгружен и перезаписан: ${relativePath}`);
+                            } else if (choice.action === 'download') {
+                                await downloadFile(drive, remoteFile.id, absolutePath);
+                                if (!silent) vscode.window.showInformationMessage(`Загружен: ${relativePath} (локальные изменения отменены)`);
+                            }
+                            // для 'skip' ничего не делаем
                         }
                     }
                 } else {
