@@ -17,10 +17,11 @@ const GOOGLE_DRIVE_CREDENTIALS_KEY = 'googleDriveCredentials';
 const GOOGLE_DRIVE_TOKENS_KEY = 'googleDriveTokens';
 const LAST_PUSHED_HASH_KEY_PREFIX = 'lastPushedHash_'; // Prefix + branch name
 const MACHINE_ID_KEY = 'machineId';
+const CONFLICT_DECISIONS_KEY = 'conflictDecisions';
 
 function escapeGdriveQueryParam(param) {
     if (!param) return "";
-    return param.replace(/\\/g, '/').replace(/'/g, "\\'");
+    return param.replace(/\\/g, '/').replace(/'/g, "'\'");
 }
 
 function activate(context) {
@@ -41,7 +42,9 @@ function activate(context) {
         vscode.commands.registerCommand('changegittogoogledrive-extension.cloneFromGoogleDrive', () => cloneFromGoogleDrive(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.manageSyncHash', () => manageSyncHash(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.uploadUntrackedFiles', () => uploadUntrackedFiles(context, false)),
-        vscode.commands.registerCommand('changegittogoogledrive-extension.syncUntrackedFiles', () => syncUntrackedFiles(context, false))
+        vscode.commands.registerCommand('changegittogoogledrive-extension.syncUntrackedFiles', () => syncUntrackedFiles(context, false)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.deleteUntrackedFile', () => deleteUntrackedFile(context)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.clearTombstones', () => clearTombstones(context))
     );
 
     // --- РЕГИСТРАЦИЯ ОБРАБОТЧИКА URI ДЛЯ GIT HOOKS ---
@@ -87,6 +90,186 @@ function activate(context) {
     }
 }
 
+// --- КОМАНДЫ УПРАВЛЕНИЯ НЕОТСЛЕЖИВАЕМЫМИ ФАЙЛАМИ ---
+
+async function deleteUntrackedFile(context) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
+
+    const drive = await getAuthenticatedClient(context);
+    if (!drive) return;
+
+    try {
+        const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
+        const includePatterns = config.get('include', []);
+        if (includePatterns.length === 0) {
+            vscode.window.showInformationMessage('Нет настроенных шаблонов для неотслеживаемых файлов.');
+            return;
+        }
+
+        const { stdout: allIgnoredFilesStr } = await runCommand('git ls-files --others --ignored --exclude-standard', workspaceRoot);
+        const allIgnoredFiles = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => f);
+        const filesToList = allIgnoredFiles.filter(file =>
+            includePatterns.some(pattern => minimatch(file, pattern, { matchBase: true }))
+        );
+
+        if (filesToList.length === 0) {
+            vscode.window.showInformationMessage('Не найдено неотслеживаемых файлов, соответствующих шаблонам.');
+            return;
+        }
+
+        const selectedFile = await vscode.window.showQuickPick(filesToList, {
+            placeHolder: 'Выберите неотслеживаемый файл для удаления'
+        });
+
+        if (!selectedFile) return;
+
+        const confirmation = await vscode.window.showWarningMessage(
+            `Вы уверены, что хотите удалить "${selectedFile}"? Файл будет удален локально, а его версия на Google Drive будет перемещена в корзину.`, 
+            { modal: true }, 
+            'Да, удалить'
+        );
+
+        if (confirmation !== 'Да, удалить') {
+            vscode.window.showInformationMessage('Операция удаления отменена.');
+            return;
+        }
+
+        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot);
+        const remoteFile = await findRemoteFile(drive, untrackedFolderId, selectedFile);
+
+        if (!remoteFile) {
+            vscode.window.showWarningMessage(`Файл "${selectedFile}" не найден на Google Drive. Удаление только локально.`);
+        } else {
+            const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId);
+            await moveFileToDeleted(drive, remoteFile, untrackedFolderId, deletedFolderId);
+        }
+
+        const localPath = path.join(workspaceRoot, selectedFile);
+        if (fsSync.existsSync(localPath)) {
+            await fs.unlink(localPath);
+        }
+
+        vscode.window.showInformationMessage(`Файл "${selectedFile}" удален локально и перемещен в корзину на Google Drive.`);
+
+    } catch (error) {
+        vscode.window.showErrorMessage(`Ошибка при удалении файла: ${error.message}`);
+    }
+}
+
+async function clearTombstones(context) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
+
+    const drive = await getAuthenticatedClient(context);
+    if (!drive) return;
+
+    try {
+        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot);
+        if (!untrackedFolderId) {
+            vscode.window.showInformationMessage('Не найдена папка неотслеживаемых файлов.');
+            return;
+        }
+        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId);
+        
+        const tombstones = await getAllRemoteFiles(drive, deletedFolderId, true);
+
+        if (tombstones.length === 0) {
+            vscode.window.showInformationMessage('Корзина неотслеживаемых файлов пуста.');
+            return;
+        }
+
+        const confirmation = await vscode.window.showWarningMessage(
+            `Найдено ${tombstones.length} файлов в корзине. Вы уверены, что хотите их все удалить навсегда? Это действие необратимо.`,
+            { modal: true },
+            'Да, очистить корзину'
+        );
+
+        if (confirmation !== 'Да, очистить корзину') {
+            vscode.window.showInformationMessage('Операция очистки отменена.');
+            return;
+        }
+
+        for (const tombstone of tombstones) {
+            await drive.files.delete({ fileId: tombstone.id });
+        }
+
+        const decisions = getConflictDecisions(context);
+        let changed = false;
+        for (const key in decisions) {
+            if (decisions[key].decision === 'ignore_tombstone') {
+                delete decisions[key];
+                changed = true;
+            }
+        }
+        if (changed) {
+            await context.workspaceState.update(CONFLICT_DECISIONS_KEY, decisions);
+        }
+
+        vscode.window.showInformationMessage(`Корзина из ${tombstones.length} файлов успешно очищена.`);
+
+    } catch (error) {
+        vscode.window.showErrorMessage(`Ошибка при очистке корзины: ${error.message}`);
+    }
+}
+
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ КОНФЛИКТОВ И НАДГРОБИЙ ---
+
+function getConflictDecisions(context) {
+    return context.workspaceState.get(CONFLICT_DECISIONS_KEY, {});
+}
+
+async function setConflictDecision(context, decision) {
+    const decisions = getConflictDecisions(context);
+    decisions[decision.key] = decision.data;
+    await context.workspaceState.update(CONFLICT_DECISIONS_KEY, decisions);
+}
+
+async function clearConflictDecision(context, key) {
+    const decisions = getConflictDecisions(context);
+    delete decisions[key];
+    await context.workspaceState.update(CONFLICT_DECISIONS_KEY, decisions);
+}
+
+async function findOrCreateDeletedFolder(drive, untrackedFolderId) {
+    const folderName = '.deleted';
+    const q = `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${untrackedFolderId}' in parents and trashed=false`;
+    let { data: { files } } = await drive.files.list({ q, fields: 'files(id)' });
+
+    if (files.length > 0) {
+        return files[0].id;
+    } else {
+        const { data } = await drive.files.create({
+            resource: { name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [untrackedFolderId] },
+            fields: 'id'
+        });
+        return data.id;
+    }
+}
+
+async function moveFileToDeleted(drive, fileToMove, untrackedFolderId, deletedFolderId) {
+    // Найдем оригинальный ID родительской папки, чтобы можно было его удалить
+    const { data: { parents } } = await drive.files.get({
+        fileId: fileToMove.id,
+        fields: 'parents'
+    });
+    const originalParentId = parents[0];
+
+    // Перемещаем файл
+    await drive.files.update({
+        fileId: fileToMove.id,
+        addParents: deletedFolderId,
+        removeParents: originalParentId,
+        fields: 'id, parents'
+    });
+}
+
+async function getAllTombstones(drive, deletedFolderId) {
+    const files = await getAllRemoteFiles(drive, deletedFolderId, true); // true to get full hierarchy
+    return new Set(files.map(f => f.name));
+}
+
+
 // --- КОМАНДЫ СИНХРОНИЗАЦИИ НЕОТСЛЕЖИВАЕМЫХ ФАЙЛОВ ---
 
 async function syncUntrackedFiles(context, silent = false) {
@@ -97,63 +280,129 @@ async function syncUntrackedFiles(context, silent = false) {
     if (!drive) return;
 
     if (!silent) {
-        vscode.window.showInformationMessage('Syncing untracked files with Google Drive...');
+        vscode.window.showInformationMessage('Синхронизация неотслеживаемых файлов...');
     }
 
     try {
         const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot);
         if (!untrackedFolderId) return;
 
-        const remoteFiles = await getAllRemoteFiles(drive, untrackedFolderId);
-        const machineId = context.globalState.get(MACHINE_ID_KEY);
+        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId);
+        const tombstoneSet = await getAllTombstones(drive, deletedFolderId);
+        const decisions = getConflictDecisions(context);
+        const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
+        let includePatterns = config.get('include', []);
 
+        const remoteFiles = await getAllRemoteFiles(drive, untrackedFolderId);
+        
+        // 1. Предложить добавить правила для новых файлов с диска
         for (const remoteFile of remoteFiles) {
             const localPath = path.join(workspaceRoot, remoteFile.name);
-            try {
-                const fileExistsLocally = fsSync.existsSync(localPath);
+            if (!fsSync.existsSync(localPath) && !includePatterns.some(p => minimatch(remoteFile.name, p))) {
+                const decisionKey = `suggest_track_${remoteFile.name}`;
+                if (decisions[decisionKey]) continue;
 
-                if (fileExistsLocally) {
+                const choice = await vscode.window.showInformationMessage(
+                    `Найден новый неотслеживаемый файл на Google Drive: "${remoteFile.name}". Добавить правило для его синхронизации?`,
+                    { modal: true },
+                    'Да, добавить', 'Нет', 'Нет и не спрашивать снова'
+                );
+
+                if (choice === 'Да, добавить') {
+                    const newPattern = await vscode.window.showInputBox({ 
+                        prompt: 'Введите glob-шаблон для добавления в настройки', 
+                        value: remoteFile.name 
+                    });
+                    if (newPattern) {
+                        const newPatterns = [...includePatterns, newPattern];
+                        await config.update('include', newPatterns, vscode.ConfigurationTarget.Workspace);
+                        includePatterns = newPatterns; // Обновляем локальную копию
+                        vscode.window.showInformationMessage(`Правило "${newPattern}" добавлено. Файл будет загружен при следующей синхронизации.`);
+                    }
+                } else if (choice === 'Нет и не спрашивать снова') {
+                    await setConflictDecision(context, { key: decisionKey, data: { decision: 'ignore_suggestion' } });
+                }
+            }
+        }
+
+        // 2. Обработать удаления по надгробиям
+        for (const tombstonePath of tombstoneSet) {
+            const localPath = path.join(workspaceRoot, tombstonePath);
+            if (fsSync.existsSync(localPath)) {
+                const localMd5 = await getFileMd5(localPath);
+                const decisionKey = `tombstone_${tombstonePath}`;
+                const savedDecision = decisions[decisionKey];
+
+                if (savedDecision && savedDecision.decision === 'ignore_tombstone' && savedDecision.localMd5 === localMd5) {
+                    continue;
+                }
+
+                const choice = await vscode.window.showWarningMessage(
+                    `Файл "${tombstonePath}" был удален на другом рабочем месте. Удалить его локально?`,
+                    { modal: true },
+                    'Да, удалить', 'Нет, оставить'
+                );
+
+                if (choice === 'Да, удалить') {
+                    await fs.unlink(localPath);
+                    await clearConflictDecision(context, decisionKey);
+                    if (!silent) vscode.window.showInformationMessage(`Файл ${tombstonePath} удален локально.`);
+                } else {
+                    await setConflictDecision(context, { key: decisionKey, data: { decision: 'ignore_tombstone', localMd5 } });
+                }
+            }
+        }
+
+        // 3. Обработать остальные файлы
+        const machineId = context.globalState.get(MACHINE_ID_KEY);
+        for (const remoteFile of remoteFiles) {
+            if (tombstoneSet.has(remoteFile.name) || !includePatterns.some(p => minimatch(remoteFile.name, p))) {
+                continue;
+            }
+
+            const localPath = path.join(workspaceRoot, remoteFile.name);
+            try {
+                if (fsSync.existsSync(localPath)) {
                     const localMd5 = await getFileMd5(localPath);
                     if (localMd5 !== remoteFile.md5Checksum) {
                         const remoteMachineId = (remoteFile.appProperties && remoteFile.appProperties.machineId) ? remoteFile.appProperties.machineId : null;
-                        
-                        if (remoteMachineId !== machineId) {
-                            let choice;
-                            while (true) {
-                                const options = [
-                                    { label: "Загрузить с Google Drive (Перезаписать локальный)", description: `Заменит ваш локальный файл: ${remoteFile.name}`, action: "download" },
-                                    { label: "Оставить локальную версию (Пропустить)", description: "Проигнорировать удаленные изменения", action: "keep" },
-                                    { label: "Выгрузить мою версию (Перезаписать удаленный)", description: "Заменит файл на Google Drive вашей версией", action: "upload" },
-                                    { label: "Сравнить изменения", description: "Показать различия между удаленным и локальным файлами", action: "compare" }
-                                ];
+                        if (remoteMachineId === machineId) continue;
 
-                                choice = await vscode.window.showQuickPick(options, {
-                                    placeHolder: `Конфликт: файл ${remoteFile.name} был изменен на другой машине. Что сделать?`,
-                                    ignoreFocusOut: true
-                                });
+                        const decisionKey = `conflict_${remoteFile.name}`;
+                        const savedDecision = decisions[decisionKey];
+                        if (savedDecision && savedDecision.localMd5 === localMd5 && savedDecision.remoteMd5 === remoteFile.md5Checksum) {
+                            continue;
+                        }
 
-                                if (choice && choice.action === 'compare') {
-                                    const tempRemotePath = path.join(os.tmpdir(), `gdrive-remote-${Date.now()}-${remoteFile.name}`);
-                                    try {
-                                        await downloadFile(drive, remoteFile.id, tempRemotePath);
-                                        const remoteUri = vscode.Uri.file(tempRemotePath);
-                                        const localUri = vscode.Uri.file(localPath);
-                                        await vscode.commands.executeCommand('vscode.diff', remoteUri, localUri, `Сравнение: ${remoteFile.name} (Google Drive) ↔ (Локальный)`);
-                                    } catch (e) {
-                                        vscode.window.showErrorMessage(`Не удалось сравнить файлы: ${e.message}`);
-                                    } finally {
-                                        if (fsSync.existsSync(tempRemotePath)) {
-                                            await fs.unlink(tempRemotePath);
-                                        }
-                                    }
-                                    // После сравнения, цикл продолжится и покажет меню снова
-                                } else {
-                                    break; // Выход из цикла, если выбрано действие или закрыто меню
+                        let choice;
+                        while (true) {
+                            const options = [
+                                { label: "Загрузить с Google Drive (Перезаписать локальный)", action: "download" },
+                                { label: "Оставить локальную версию (Пропустить)", action: "keep" },
+                                { label: "Выгрузить мою версию (Перезаписать удаленный)", action: "upload" },
+                                { label: "Сравнить изменения", action: "compare" }
+                            ];
+                            choice = await vscode.window.showQuickPick(options, { placeHolder: `Конфликт для ${remoteFile.name}. Что сделать?`, ignoreFocusOut: true });
+
+                            if (choice && choice.action === 'compare') {
+                                const tempRemotePath = path.join(os.tmpdir(), `gdrive-remote-${Date.now()}-${path.basename(remoteFile.name)}`);
+                                try {
+                                    await downloadFile(drive, remoteFile.id, tempRemotePath);
+                                    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(tempRemotePath), vscode.Uri.file(localPath), `${remoteFile.name} (Google Drive) ↔ (Локальный)`);
+                                } finally {
+                                    if(fsSync.existsSync(tempRemotePath)) await fs.unlink(tempRemotePath);
                                 }
+                            } else {
+                                break;
                             }
+                        }
 
-                            if (!choice) continue; // Пропустить, если пользователь закрыл меню
+                        if (!choice) continue;
 
+                        if (choice.action === 'keep') {
+                            await setConflictDecision(context, { key: decisionKey, data: { decision: 'keep', localMd5, remoteMd5: remoteFile.md5Checksum } });
+                        } else {
+                            await clearConflictDecision(context, decisionKey);
                             if (choice.action === 'download') {
                                 await downloadFile(drive, remoteFile.id, localPath);
                                 if (!silent) vscode.window.showInformationMessage(`Загружен: ${remoteFile.name}`);
@@ -161,24 +410,23 @@ async function syncUntrackedFiles(context, silent = false) {
                                 await updateFile(drive, remoteFile.id, localPath, machineId);
                                 if (!silent) vscode.window.showInformationMessage(`Выгружен: ${remoteFile.name}`);
                             }
-                            // Для 'keep' ничего делать не нужно
                         }
                     }
                 } else {
                     await downloadFile(drive, remoteFile.id, localPath);
-                    if (!silent) vscode.window.showInformationMessage(`Downloaded new file: ${remoteFile.name}`);
+                    if (!silent) vscode.window.showInformationMessage(`Загружен новый файл: ${remoteFile.name}`);
                 }
             } catch (error) {
-                vscode.window.showErrorMessage(`Error processing file ${remoteFile.name}: ${error.message}`);
+                vscode.window.showErrorMessage(`Ошибка обработки файла ${remoteFile.name}: ${error.message}`);
             }
         }
 
         if (!silent) {
-            vscode.window.showInformationMessage('Finished syncing untracked files.');
+            vscode.window.showInformationMessage('Синхронизация неотслеживаемых файлов завершена.');
         }
 
     } catch (error) {
-        vscode.window.showErrorMessage(`Failed to sync untracked files: ${error.message}`);
+        vscode.window.showErrorMessage(`Ошибка синхронизации: ${error.message}`);
     }
 }
 
@@ -190,30 +438,29 @@ async function uploadUntrackedFiles(context, silent = false) {
     if (!drive) return;
 
     if (!silent) {
-        vscode.window.showInformationMessage('Uploading specified files to Google Drive...');
+        vscode.window.showInformationMessage('Выгрузка неотслеживаемых файлов...');
     }
 
     try {
         const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot);
         if (!untrackedFolderId) return;
 
+        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId);
+        const tombstoneSet = await getAllTombstones(drive, deletedFolderId);
+        const decisions = getConflictDecisions(context);
+
         const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
         const includePatterns = config.get('include', []);
-
         if (includePatterns.length === 0) {
-            if (!silent) vscode.window.showInformationMessage('No include patterns are configured. Nothing to upload.');
+            if (!silent) vscode.window.showInformationMessage('Нет настроенных шаблонов для выгрузки.');
             return;
         }
 
         const { stdout: allIgnoredFilesStr } = await runCommand('git ls-files --others --ignored --exclude-standard', workspaceRoot);
-        let allIgnoredFiles = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => f);
+        const filesToUpload = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => f && includePatterns.some(p => minimatch(f, p, { matchBase: true })));
 
-        const filesToUpload = allIgnoredFiles.filter(file =>
-            includePatterns.some(pattern => minimatch(file, pattern, { matchBase: true }))
-        );
-
-        if (filesToUpload.length === 0) {
-            if (!silent) vscode.window.showInformationMessage('No files matched the include patterns. Nothing to upload.');
+        if (filesToUpload.length === 0 && !silent) {
+            vscode.window.showInformationMessage('Не найдено файлов для выгрузки, соответствующих шаблонам.');
             return;
         }
 
@@ -222,77 +469,104 @@ async function uploadUntrackedFiles(context, silent = false) {
         for (const relativePath of filesToUpload) {
             const absolutePath = path.join(workspaceRoot, relativePath);
             try {
+                // 1. Проверка на надгробие
+                if (tombstoneSet.has(relativePath)) {
+                    const localMd5 = await getFileMd5(absolutePath);
+                    const decisionKey = `tombstone_${relativePath}`;
+                    const savedDecision = decisions[decisionKey];
+
+                    if (savedDecision && savedDecision.decision === 'ignore_tombstone' && savedDecision.localMd5 === localMd5) {
+                        continue;
+                    }
+
+                    const choice = await vscode.window.showWarningMessage(
+                        `Файл \"${relativePath}\" помечен как удаленный. Удалить его локально, чтобы завершить синхронизацию?`,
+                        { modal: true },
+                        'Да, удалить', 'Нет, оставить'
+                    );
+
+                    if (choice === 'Да, удалить') {
+                        await fs.unlink(absolutePath);
+                        await clearConflictDecision(context, decisionKey);
+                        if (!silent) vscode.window.showInformationMessage(`Локальный файл ${relativePath} удален.`);
+                    } else {
+                        await setConflictDecision(context, { key: decisionKey, data: { decision: 'ignore_tombstone', localMd5 } });
+                    }
+                    continue; // В любом случае не выгружаем файл, для которого есть надгробие
+                }
+
+                // 2. Логика создания/обновления/конфликта
                 const remoteFile = await findRemoteFile(drive, untrackedFolderId, relativePath);
                 const localMd5 = await getFileMd5(absolutePath);
 
                 if (remoteFile) {
                     if (localMd5 !== remoteFile.md5Checksum) {
                         const remoteMachineId = (remoteFile.appProperties && remoteFile.appProperties.machineId) ? remoteFile.appProperties.machineId : null;
-
                         if (remoteMachineId === machineId) {
                             await updateFile(drive, remoteFile.id, absolutePath, machineId);
-                            if (!silent) vscode.window.showInformationMessage(`Updated: ${relativePath}`);
-                        } else {
-                            let choice;
-                            while (true) {
-                                const options = [
-                                    { label: "Выгрузить мою версию (Перезаписать удаленный)", description: `Заменит удаленный файл: ${relativePath}`, action: "upload" },
-                                    { label: "Пропустить выгрузку", description: "Не выгружать этот файл", action: "skip" },
-                                    { label: "Загрузить удаленную версию (Перезаписать локальный)", description: "Заменит ваш локальный файл версией с Google Drive", action: "download" },
-                                    { label: "Сравнить изменения", description: "Показать различия между удаленным и локальным файлами", action: "compare" }
-                                ];
+                            if (!silent) vscode.window.showInformationMessage(`Обновлен: ${relativePath}`);
+                            continue;
+                        }
 
-                                choice = await vscode.window.showQuickPick(options, {
-                                    placeHolder: `Конфликт: файл ${relativePath} на Google Drive был изменен. Что сделать?`,
-                                    ignoreFocusOut: true
-                                });
+                        const decisionKey = `conflict_${relativePath}`;
+                        const savedDecision = decisions[decisionKey];
+                        if (savedDecision && savedDecision.localMd5 === localMd5 && savedDecision.remoteMd5 === remoteFile.md5Checksum) {
+                            continue;
+                        }
 
-                                if (choice && choice.action === 'compare') {
-                                    const tempRemotePath = path.join(os.tmpdir(), `gdrive-remote-${Date.now()}-${path.basename(relativePath)}`);
-                                    try {
-                                        await downloadFile(drive, remoteFile.id, tempRemotePath);
-                                        const remoteUri = vscode.Uri.file(tempRemotePath);
-                                        const localUri = vscode.Uri.file(absolutePath);
-                                        await vscode.commands.executeCommand('vscode.diff', remoteUri, localUri, `Сравнение: ${relativePath} (Google Drive) ↔ (Локальный)`);
-                                    } catch (e) {
-                                        vscode.window.showErrorMessage(`Не удалось сравнить файлы: ${e.message}`);
-                                    } finally {
-                                        if (fsSync.existsSync(tempRemotePath)) {
-                                            await fs.unlink(tempRemotePath);
-                                        }
-                                    }
-                                } else {
-                                    break;
+                        let choice;
+                        while (true) {
+                            const options = [
+                                { label: "Выгрузить мою версию (Перезаписать удаленный)", action: "upload" },
+                                { label: "Пропустить выгрузку", action: "skip" },
+                                { label: "Загрузить удаленную версию (Перезаписать локальный)", action: "download" },
+                                { label: "Сравнить изменения", action: "compare" }
+                            ];
+                            choice = await vscode.window.showQuickPick(options, { placeHolder: `Конфликт для ${relativePath}. Что сделать?`, ignoreFocusOut: true });
+
+                            if (choice && choice.action === 'compare') {
+                                const tempRemotePath = path.join(os.tmpdir(), `gdrive-remote-${Date.now()}-${path.basename(relativePath)}`);
+                                try {
+                                    await downloadFile(drive, remoteFile.id, tempRemotePath);
+                                    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(tempRemotePath), vscode.Uri.file(absolutePath), `${relativePath} (Google Drive) ↔ (Локальный)`);
+                                } finally {
+                                    if(fsSync.existsSync(tempRemotePath)) await fs.unlink(tempRemotePath);
                                 }
+                            } else {
+                                break;
                             }
+                        }
 
-                            if (!choice) continue;
+                        if (!choice) continue;
 
+                        if (choice.action === 'skip') {
+                            await setConflictDecision(context, { key: decisionKey, data: { decision: 'skip', localMd5, remoteMd5: remoteFile.md5Checksum } });
+                        } else {
+                            await clearConflictDecision(context, decisionKey);
                             if (choice.action === 'upload') {
                                 await updateFile(drive, remoteFile.id, absolutePath, machineId);
-                                if (!silent) vscode.window.showInformationMessage(`Выгружен и перезаписан: ${relativePath}`);
+                                if (!silent) vscode.window.showInformationMessage(`Выгружен: ${relativePath}`);
                             } else if (choice.action === 'download') {
                                 await downloadFile(drive, remoteFile.id, absolutePath);
-                                if (!silent) vscode.window.showInformationMessage(`Загружен: ${relativePath} (локальные изменения отменены)`);
+                                if (!silent) vscode.window.showInformationMessage(`Загружен: ${relativePath}`);
                             }
-                            // для 'skip' ничего не делаем
                         }
                     }
                 } else {
                     await createFile(drive, untrackedFolderId, absolutePath, relativePath, machineId);
-                    if (!silent) vscode.window.showInformationMessage(`Uploaded new file: ${relativePath}`);
+                    if (!silent) vscode.window.showInformationMessage(`Создан: ${relativePath}`);
                 }
             } catch (error) {
-                vscode.window.showErrorMessage(`Error processing file ${relativePath}: ${error.message}`);
+                vscode.window.showErrorMessage(`Ошибка обработки файла ${relativePath}: ${error.message}`);
             }
         }
 
         if (!silent) {
-            vscode.window.showInformationMessage('Finished uploading files.');
+            vscode.window.showInformationMessage('Выгрузка неотслеживаемых файлов завершена.');
         }
 
     } catch (error) {
-        vscode.window.showErrorMessage(`Failed to upload files: ${error.message}`);
+        vscode.window.showErrorMessage(`Ошибка выгрузки: ${error.message}`);
     }
 }
 
@@ -866,7 +1140,7 @@ async function getAllRemoteFiles(drive, folderId) {
     let pageToken = null;
     do {
         const res = await drive.files.list({
-            q: `'${folderId}' in parents and trashed=false`,
+            q: `'${folderId}' in parents and trashed=false and name != '.deleted'`,
             fields: 'nextPageToken, files(id, name, md5Checksum, appProperties)',
             pageToken: pageToken,
         });

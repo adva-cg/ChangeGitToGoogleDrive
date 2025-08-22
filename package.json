@@ -1,15 +1,15 @@
 {
   "name": "changegittogoogledrive-extension",
-  "displayName": "ChangeGitToGoogleDrive Extension",
-  "description": "An extension to archive and upload workspace files to Google Drive.",
-  "version": "1.1.0",
+  "displayName": "ChangeGitToGoogleDrive",
+  "description": "A VS Code extension to sync git commits as bundles with Google Drive",
+  "version": "1.2.0",
   "publisher": "VitalyAdadurov",
   "repository": {
     "type": "git",
     "url": "https://github.com/adva-cg/ChangeGitToGoogleDrive.git"
   },
   "engines": {
-    "vscode": "^1.83.0"
+    "vscode": "^1.85.0"
   },
   "categories": [
     "Other"
@@ -23,89 +23,94 @@
     "onCommand:changegittogoogledrive-extension.cloneFromGoogleDrive",
     "onCommand:changegittogoogledrive-extension.manageSyncHash",
     "onCommand:changegittogoogledrive-extension.uploadUntrackedFiles",
-    "onCommand:changegittogoogledrive-extension.syncUntrackedFiles"
+    "onCommand:changegittogoogledrive-extension.syncUntrackedFiles",
+    "onCommand:changegittogoogledrive-extension.deleteUntrackedFile",
+    "onCommand:changegittogoogledrive-extension.clearTombstones"
   ],
   "main": "./extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "changegittogoogledrive-extension.cloneFromGoogleDrive",
-        "title": "Клонировать из Google Drive",
-        "category": "Git-To-Google-Drive"
-      },
-      {
-        "command": "changegittogoogledrive-extension.initialUpload",
-        "title": "Начальная выгрузка в Google Drive",
-        "category": "Git-To-Google-Drive"
-      },
-      {
-        "command": "changegittogoogledrive-extension.sync",
-        "title": "Синхронизация с Google Drive",
-        "category": "Git-To-Google-Drive"
-      },
-      {
         "command": "changegittogoogledrive-extension.setupGoogleCredentials",
-        "title": "Установить учетные данные Google",
+        "title": "1. Настроить учетные данные Google",
         "category": "Git-To-Google-Drive"
       },
       {
         "command": "changegittogoogledrive-extension.authenticateWithGoogle",
-        "title": "Аутентификация с Google",
+        "title": "2. Аутентификация с Google",
+        "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.initialUpload",
+        "title": "3. Первоначальная выгрузка истории (Initial Upload)",
+        "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.cloneFromGoogleDrive",
+        "title": "4. Клонировать проект из Google Drive",
+        "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.sync",
+        "title": "Синхронизировать историю (Sync)",
         "category": "Git-To-Google-Drive"
       },
       {
         "command": "changegittogoogledrive-extension.installGitHooks",
-        "title": "Установить Git Hooks",
+        "title": "Установить Git Hooks для авто-синхронизации",
         "category": "Git-To-Google-Drive"
       },
       {
         "command": "changegittogoogledrive-extension.manageSyncHash",
-        "title": "Показать/изменить хеш синхронизации",
+        "title": "Управление хешем последней синхронизации",
         "category": "Git-To-Google-Drive"
       },
       {
         "command": "changegittogoogledrive-extension.uploadUntrackedFiles",
-        "title": "Выгрузить неотслеживаемые файлы на Google Drive",
+        "title": "Неотслеживаемые файлы: Выгрузить на Google Drive (Upload)",
         "category": "Git-To-Google-Drive"
       },
       {
         "command": "changegittogoogledrive-extension.syncUntrackedFiles",
-        "title": "Синхронизировать неотслеживаемые файлы с Google Drive",
+        "title": "Неотслеживаемые файлы: Синхронизировать с Google Drive (Sync)",
+        "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.deleteUntrackedFile",
+        "title": "Неотслеживаемые файлы: Удалить файл (в корзину)",
+        "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.clearTombstones",
+        "title": "Неотслеживаемые файлы: Очистить корзину",
         "category": "Git-To-Google-Drive"
       }
     ],
     "configuration": {
-      "title": "ChangeGitToGoogleDrive",
+      "title": "ChangeGitToGoogleDrive Untracked Files",
       "properties": {
         "changegittogoogledrive-extension.untrackedFiles.include": {
           "type": "array",
           "default": [],
-          "description": "An array of glob patterns to include when uploading untracked files.",
-          "items": {
-            "type": "string"
-          }
+          "description": "Массив glob-шаблонов для файлов, которые должны синхронизироваться как 'неотслеживаемые'."
         },
         "changegittogoogledrive-extension.untrackedFiles.autoUpload": {
           "type": "boolean",
           "default": false,
-          "description": "Enable automatic uploading of untracked files on change."
+          "description": "Автоматически выгружать неотслеживаемые файлы при их изменении."
         },
         "changegittogoogledrive-extension.untrackedFiles.syncOnStartup": {
           "type": "boolean",
-          "default": true,
-          "description": "Enable automatic syncing of untracked files on startup."
+          "default": false,
+          "description": "Автоматически синхронизировать неотслеживаемые файлы при запуске VS Code."
         }
       }
     }
   },
   "devDependencies": {
-    "@types/glob": "^8.1.0",
-    "@types/mocha": "^10.0.2",
+    "@types/vscode": "^1.85.0",
     "@types/node": "18.x",
-    "@types/vscode": "^1.83.0",
-    "@vscode/test-electron": "^2.3.4",
-    "glob": "^8.1.0",
-    "mocha": "^10.2.0"
+    "eslint": "^8.56.0"
   },
   "dependencies": {
     "googleapis": "^153.0.0",
