@@ -703,57 +703,115 @@ async function pullCommits(context) {
     const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
     if (!bundleFolderId) return;
 
-    const currentBranch = await getCurrentBranch(workspaceRoot);
-    if (!currentBranch) {
-        vscode.window.showInformationMessage('Not on a branch, skipping pull.');
-        return;
-    }
+    vscode.window.showInformationMessage('Checking for remote changes...');
 
-    const q = `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle' and name contains '${escapeGdriveQueryParam(currentBranch)}--'`;
-    const { data: { files: remoteBundles } } = await drive.files.list({
+    // 1. Get all remote bundles
+    const q = `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle'`;
+    const { data: { files: allRemoteBundles } } = await drive.files.list({
         q: q,
         fields: 'files(id, name, createdTime)',
         orderBy: 'createdTime',
     });
 
-    if (!remoteBundles || remoteBundles.length === 0) {
-        vscode.window.showInformationMessage('No remote commits found to pull.');
+    if (!allRemoteBundles || allRemoteBundles.length === 0) {
+        vscode.window.showInformationMessage('No remote bundles found.');
         return;
     }
 
+    // 2. Get local branches and commits
+    const { stdout: localBranchStr } = await runCommand('git branch --list --no-color', workspaceRoot);
+    const localBranches = new Set(localBranchStr.split('\n').map(b => b.trim().replace('* ', '')).filter(b => b));
+    const currentBranch = await getCurrentBranch(workspaceRoot);
     const { stdout: localCommitsResult } = await runCommand('git rev-list --all --pretty=format:%H', workspaceRoot);
     const localCommitSet = new Set(localCommitsResult.trim().split(/\s+/));
 
-    const bundlesToDownload = remoteBundles.filter(bundle => {
-        const commitHash = bundle.name.split('--')[1]?.replace('.bundle', '');
-        return commitHash && !localCommitSet.has(commitHash);
-    });
+    // 3. Group bundles by branch for commits we don't have yet
+    const remoteBundlesByBranch = new Map();
+    for (const bundle of allRemoteBundles) {
+        const parts = bundle.name.split('--');
+        if (parts.length < 2) continue;
+        const branchName = parts[0];
+        const commitHash = parts[1].replace('.bundle', '');
+        if (!commitHash || localCommitSet.has(commitHash)) {
+            continue;
+        }
 
-    if (bundlesToDownload.length === 0) {
+        if (!remoteBundlesByBranch.has(branchName)) {
+            remoteBundlesByBranch.set(branchName, []);
+        }
+        remoteBundlesByBranch.get(branchName).push(bundle);
+    }
+
+    if (remoteBundlesByBranch.size === 0) {
         vscode.window.showInformationMessage('Local repository is up-to-date.');
         return;
     }
 
-    vscode.window.showInformationMessage(`Found ${bundlesToDownload.length} new commit(s) to download.`);
-
     const tempDir = path.join(workspaceRoot, '.git', 'gdrive-temp-bundles');
     await fs.mkdir(tempDir, { recursive: true });
+    let changesMade = false;
 
     try {
-        for (const bundle of bundlesToDownload) {
-            const tempBundlePath = path.join(tempDir, bundle.name);
-            await downloadFile(drive, bundle.id, tempBundlePath);
-            await runCommand(`git fetch \"${tempBundlePath}\"`, workspaceRoot);
-            vscode.window.showInformationMessage(`Fetched commit ${bundle.name.split('--')[1]?.substring(0, 7)}.`);
+        for (const [branchName, bundles] of remoteBundlesByBranch.entries()) {
+            if (localBranches.has(branchName)) {
+                // --- Logic for EXISTING branches (only the current one for now) ---
+                if (branchName !== currentBranch) continue;
+
+                vscode.window.showInformationMessage(`Found ${bundles.length} new commit(s) for current branch '${branchName}'. Fetching...`);
+                for (const bundle of bundles) {
+                    const tempBundlePath = path.join(tempDir, bundle.name);
+                    await downloadFile(drive, bundle.id, tempBundlePath);
+                    await runCommand(`git fetch "${tempBundlePath}"`, workspaceRoot);
+                }
+                changesMade = true;
+                try {
+                    await runCommand(`git merge --ff-only FETCH_HEAD`, workspaceRoot);
+                    vscode.window.showInformationMessage(`Successfully merged remote changes into '${branchName}'.`);
+                } catch (error) {
+                    vscode.window.showInformationMessage(`New commits for '${branchName}' have been fetched. Please merge or rebase manually.`);
+                }
+
+            } else {
+                // --- Logic for NEW branches ---
+                const choice = await vscode.window.showInformationMessage(
+                    `Found new remote branch '${branchName}' with ${bundles.length} new commit(s). Create local branch?`,
+                    { modal: true },
+                    'Yes'
+                );
+
+                if (choice === 'Yes') {
+                    vscode.window.showInformationMessage(`Fetching bundles for new branch '${branchName}'...`);
+                    let lastHash = '';
+                    for (const bundle of bundles) { // Already sorted by createdTime
+                        const tempBundlePath = path.join(tempDir, bundle.name);
+                        await downloadFile(drive, bundle.id, tempBundlePath);
+                        await runCommand(`git fetch "${tempBundlePath}"`, workspaceRoot);
+                        lastHash = bundle.name.split('--')[1]?.replace('.bundle', '');
+                    }
+
+                    if (lastHash) {
+                        try {
+                            await runCommand(`git checkout -b ${branchName} ${lastHash}`, workspaceRoot);
+                            await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${branchName}`, lastHash);
+                            vscode.window.showInformationMessage(`Successfully created and checked out branch '${branchName}'.`);
+                            changesMade = true;
+                        } catch (error) {
+                            vscode.window.showErrorMessage(`Failed to create branch '${branchName}': ${error.message}`);
+                        }
+                    }
+                }
+            }
         }
-
-        await runCommand(`git merge --ff-only FETCH_HEAD`, workspaceRoot);
-        vscode.window.showInformationMessage('Successfully merged remote changes.');
-
-    } catch (error) {
-        vscode.window.showInformationMessage('New commits have been fetched. Please merge or rebase your branch as needed.');
     } finally {
-        await fs.rm(tempDir, { recursive: true, force: true });
+        if (fsSync.existsSync(tempDir)) {
+            await fs.rm(tempDir, { recursive: true, force: true });
+        }
+    }
+
+    if (changesMade) {
+        vscode.window.showInformationMessage('Pull from Google Drive finished.');
+    } else {
+        vscode.window.showInformationMessage('No new changes to pull for current branch or any new branches.');
     }
 }
 
