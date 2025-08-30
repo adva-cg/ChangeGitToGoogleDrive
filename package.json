@@ -2,7 +2,7 @@
   "name": "changegittogoogledrive-extension",
   "displayName": "ChangeGitToGoogleDrive",
   "description": "A VS Code extension to sync git commits as bundles with Google Drive",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "publisher": "VitalyAdadurov",
   "repository": {
     "type": "git",
@@ -103,6 +103,11 @@
           "type": "boolean",
           "default": false,
           "description": "Автоматически синхронизировать неотслеживаемые файлы при запуске VS Code."
+        },
+        "changegittogoogledrive-extension.untrackedFiles.exclude": {
+          "type": "array",
+          "default": [],
+          "description": "Массив glob-шаблонов для исключения файлов из синхронизации. Имеет приоритет над 'include'."
         }
       }
     }

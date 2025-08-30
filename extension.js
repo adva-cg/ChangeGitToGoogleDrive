@@ -102,6 +102,7 @@ async function deleteUntrackedFile(context) {
     try {
         const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
         const includePatterns = config.get('include', []);
+        const excludePatterns = config.get('exclude', []);
         if (includePatterns.length === 0) {
             vscode.window.showInformationMessage('Нет настроенных шаблонов для неотслеживаемых файлов.');
             return;
@@ -109,9 +110,13 @@ async function deleteUntrackedFile(context) {
 
         const { stdout: allIgnoredFilesStr } = await runCommand('git ls-files --others --ignored --exclude-standard', workspaceRoot);
         const allIgnoredFiles = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => f);
-        const filesToList = allIgnoredFiles.filter(file =>
-            includePatterns.some(pattern => minimatch(file, pattern, { matchBase: true }))
-        );
+        const filesToList = allIgnoredFiles.filter(file => {
+            if (!file) return false;
+            const isIncluded = includePatterns.some(p => minimatch(file, p, { matchBase: true }));
+            if (!isIncluded) return false;
+            const isExcluded = excludePatterns.some(p => minimatch(file, p, { matchBase: true }));
+            return !isExcluded;
+        });
 
         if (filesToList.length === 0) {
             vscode.window.showInformationMessage('Не найдено неотслеживаемых файлов, соответствующих шаблонам.');
@@ -292,13 +297,17 @@ async function syncUntrackedFiles(context, silent = false) {
         const decisions = getConflictDecisions(context);
         const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
         let includePatterns = config.get('include', []);
+        const excludePatterns = config.get('exclude', []);
 
         const remoteFiles = await getAllRemoteFiles(drive, untrackedFolderId);
         
         // 1. Предложить добавить правила для новых файлов с диска
         for (const remoteFile of remoteFiles) {
             const localPath = path.join(workspaceRoot, remoteFile.name);
-            if (!fsSync.existsSync(localPath) && !includePatterns.some(p => minimatch(remoteFile.name, p))) {
+            const isIncluded = includePatterns.some(p => minimatch(remoteFile.name, p));
+            const isExcluded = excludePatterns.some(p => minimatch(remoteFile.name, p));
+
+            if (!fsSync.existsSync(localPath) && !isIncluded && !isExcluded) {
                 const decisionKey = `suggest_track_${remoteFile.name}`;
                 if (decisions[decisionKey]) continue;
 
@@ -310,7 +319,7 @@ async function syncUntrackedFiles(context, silent = false) {
 
                 if (choice === 'Да, добавить') {
                     const newPattern = await vscode.window.showInputBox({ 
-                        prompt: 'Введите glob-шаблон для добавления в настройки', 
+                        prompt: 'Введите glob-шаблон для добавления в настройки',
                         value: remoteFile.name 
                     });
                     if (newPattern) {
@@ -356,7 +365,10 @@ async function syncUntrackedFiles(context, silent = false) {
         // 3. Обработать остальные файлы
         const machineId = context.globalState.get(MACHINE_ID_KEY);
         for (const remoteFile of remoteFiles) {
-            if (tombstoneSet.has(remoteFile.name) || !includePatterns.some(p => minimatch(remoteFile.name, p))) {
+            const isIncluded = includePatterns.some(p => minimatch(remoteFile.name, p));
+            const isExcluded = excludePatterns.some(p => minimatch(remoteFile.name, p));
+
+            if (tombstoneSet.has(remoteFile.name) || !isIncluded || isExcluded) {
                 continue;
             }
 
@@ -451,13 +463,20 @@ async function uploadUntrackedFiles(context, silent = false) {
 
         const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
         const includePatterns = config.get('include', []);
+        const excludePatterns = config.get('exclude', []);
         if (includePatterns.length === 0) {
             if (!silent) vscode.window.showInformationMessage('Нет настроенных шаблонов для выгрузки.');
             return;
         }
 
         const { stdout: allIgnoredFilesStr } = await runCommand('git ls-files --others --ignored --exclude-standard', workspaceRoot);
-        const filesToUpload = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => f && includePatterns.some(p => minimatch(f, p, { matchBase: true })));
+        const filesToUpload = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => {
+            if (!f) return false;
+            const isIncluded = includePatterns.some(p => minimatch(f, p, { matchBase: true }));
+            if (!isIncluded) return false;
+            const isExcluded = excludePatterns.some(p => minimatch(f, p, { matchBase: true }));
+            return !isExcluded;
+        });
 
         if (filesToUpload.length === 0 && !silent) {
             vscode.window.showInformationMessage('Не найдено файлов для выгрузки, соответствующих шаблонам.');
@@ -1151,6 +1170,8 @@ async function getAllRemoteFiles(drive, folderId) {
 }
 
 async function downloadFile(drive, fileId, destPath) {
+    const destDir = path.dirname(destPath);
+    await fs.mkdir(destDir, { recursive: true });
     const dest = fsSync.createWriteStream(destPath);
     const { data: fileStream } = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
     await new Promise((resolve, reject) => {
