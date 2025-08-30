@@ -108,7 +108,7 @@ async function deleteUntrackedFile(context) {
             return;
         }
 
-        const { stdout: allIgnoredFilesStr } = await runCommand('git ls-files --others --ignored --exclude-standard', workspaceRoot);
+        const { stdout: allIgnoredFilesStr } = await runCommand('git -c core.quotePath=false ls-files --others --ignored --exclude-standard', workspaceRoot);
         const allIgnoredFiles = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => f);
         const filesToList = allIgnoredFiles.filter(file => {
             if (!file) return false;
@@ -116,7 +116,7 @@ async function deleteUntrackedFile(context) {
             if (!isIncluded) return false;
             const isExcluded = excludePatterns.some(p => minimatch(file, p, { matchBase: true }));
             return !isExcluded;
-        });
+        }).sort();
 
         if (filesToList.length === 0) {
             vscode.window.showInformationMessage('Не найдено неотслеживаемых файлов, соответствующих шаблонам.');
@@ -484,7 +484,7 @@ async function uploadUntrackedFiles(context, silent = false) {
             return;
         }
 
-        const { stdout: allIgnoredFilesStr } = await runCommand('git ls-files --others --ignored --exclude-standard', workspaceRoot);
+        const { stdout: allIgnoredFilesStr } = await runCommand('git -c core.quotePath=false ls-files --others --ignored --exclude-standard', workspaceRoot);
         const filesToUpload = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => {
             if (!f) return false;
             const isIncluded = includePatterns.some(p => minimatch(f, p, { matchBase: true }));
