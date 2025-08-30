@@ -1154,7 +1154,25 @@ async function downloadFile(drive, fileId, destPath) {
     const dest = fsSync.createWriteStream(destPath);
     const { data: fileStream } = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
     await new Promise((resolve, reject) => {
-        fileStream.pipe(dest).on('finish', resolve).on('error', reject);
+        fileStream.pipe(dest)
+            .on('finish', resolve)
+            .on('error', (error) => {
+                // If the file is busy/locked, we'll show a message and skip it.
+                if (error.code === 'EBUSY' || error.code === 'EPERM') {
+                    vscode.window.showInformationMessage(`File is locked, skipping for now: ${path.basename(destPath)}`);
+                    // Attempt to clean up the partial file.
+                    // We use the sync version here because we are in a callback and don't want to complicate with async/await.
+                    // The stream is already closed on error.
+                    try {
+                        fsSync.unlinkSync(destPath);
+                    } catch (e) {
+                        // Ignore errors during cleanup
+                    }
+                    resolve(); // Resolve to not stop the entire sync process.
+                } else {
+                    reject(error); // For other errors, fail as usual.
+                }
+            });
     });
 }
 
