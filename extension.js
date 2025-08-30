@@ -123,15 +123,19 @@ async function deleteUntrackedFile(context) {
             return;
         }
 
-        const selectedFile = await vscode.window.showQuickPick(filesToList, {
-            placeHolder: 'Выберите неотслеживаемый файл для удаления'
+        const selectedFiles = await vscode.window.showQuickPick(filesToList, {
+            placeHolder: 'Выберите неотслеживаемые файлы для удаления',
+            canPickMany: true
         });
 
-        if (!selectedFile) return;
+        if (!selectedFiles || selectedFiles.length === 0) {
+            vscode.window.showInformationMessage('Файлы не выбраны.');
+            return;
+        }
 
         const confirmation = await vscode.window.showWarningMessage(
-            `Вы уверены, что хотите удалить "${selectedFile}"? Файл будет удален локально, а его версия на Google Drive будет перемещена в корзину.`, 
-            { modal: true }, 
+            `Вы уверены, что хотите удалить ${selectedFiles.length} файл(ов)? Файлы будут удалены локально, а их версии на Google Drive будут перемещены в корзину.`,
+            { modal: true },
             'Да, удалить'
         );
 
@@ -141,21 +145,32 @@ async function deleteUntrackedFile(context) {
         }
 
         const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot);
-        const remoteFile = await findRemoteFile(drive, untrackedFolderId, selectedFile);
+        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId);
+        let deletedCount = 0;
+        let errorCount = 0;
 
-        if (!remoteFile) {
-            vscode.window.showWarningMessage(`Файл "${selectedFile}" не найден на Google Drive. Удаление только локально.`);
-        } else {
-            const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId);
-            await moveFileToDeleted(drive, remoteFile, untrackedFolderId, deletedFolderId);
+        for (const selectedFile of selectedFiles) {
+            try {
+                const remoteFile = await findRemoteFile(drive, untrackedFolderId, selectedFile);
+
+                if (!remoteFile) {
+                    vscode.window.showWarningMessage(`Файл "${selectedFile}" не найден на Google Drive. Удаление только локально.`);
+                } else {
+                    await moveFileToDeleted(drive, remoteFile, untrackedFolderId, deletedFolderId);
+                }
+
+                const localPath = path.join(workspaceRoot, selectedFile);
+                if (fsSync.existsSync(localPath)) {
+                    await fs.unlink(localPath);
+                }
+                deletedCount++;
+            } catch (fileError) {
+                errorCount++;
+                vscode.window.showErrorMessage(`Ошибка при удалении файла "${selectedFile}": ${fileError.message}`);
+            }
         }
 
-        const localPath = path.join(workspaceRoot, selectedFile);
-        if (fsSync.existsSync(localPath)) {
-            await fs.unlink(localPath);
-        }
-
-        vscode.window.showInformationMessage(`Файл "${selectedFile}" удален локально и перемещен в корзину на Google Drive.`);
+        vscode.window.showInformationMessage(`Удалено ${deletedCount} из ${selectedFiles.length} файлов. Ошибок: ${errorCount}.`);
 
     } catch (error) {
         vscode.window.showErrorMessage(`Ошибка при удалении файла: ${error.message}`);
