@@ -626,9 +626,13 @@ async function initialUpload(context) {
 
 async function sync(context) {
     vscode.window.showInformationMessage('Syncing with Google Drive...');
-    await pullCommits(context);
-    await pushCommits(context);
-    vscode.window.showInformationMessage('Sync finished.');
+    try {
+        await pullCommits(context);
+        await pushCommits(context);
+        vscode.window.showInformationMessage('Sync finished.');
+    } catch (error) {
+        vscode.window.showErrorMessage(`Sync failed: ${error.message}`);
+    }
 }
 
 async function pushCommits(context) {
@@ -1106,6 +1110,8 @@ async function authenticateWithGoogle(context) {
             scope: ['https://www.googleapis.com/auth/drive.file'],
             prompt: 'consent'
         });
+        console.log(`Attempting to open authentication URL: ${authUrl}`);
+        vscode.window.showInformationMessage('Attempting to open the authentication URL in your browser. If it fails, please check for the URL in the developer tools console (Help > Toggle Developer Tools).');
         vscode.env.openExternal(vscode.Uri.parse(authUrl));
     });
 }
@@ -1128,12 +1134,15 @@ async function getAuthenticatedClient(context) {
 
     if (oauth2Client.isTokenExpiring()) {
         try {
-            const { credentials: newTokens } = await oauth2Client.refreshAccessToken();
+            const { tokens: newTokens } = await oauth2Client.refreshAccessToken();
+            const oldTokens = JSON.parse(tokensStr);
+            if (oldTokens.refresh_token && !newTokens.refresh_token) {
+                newTokens.refresh_token = oldTokens.refresh_token;
+            }
             await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(newTokens));
             oauth2Client.setCredentials(newTokens);
         } catch (error) {
-            vscode.window.showErrorMessage(`Failed to refresh token: ${error.message}. Please re-authenticate.`);
-            await authenticateWithGoogle(context);
+            vscode.window.showErrorMessage(`Failed to refresh token: ${error.message}. Please run the 'Authenticate with Google' command again.`);
             return null;
         }
     }
