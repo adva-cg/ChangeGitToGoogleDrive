@@ -722,38 +722,28 @@ async function pullCommits(context) {
         return;
     }
 
-    // 2. Get local branches and commits
+    // 2. Get local branches
     const { stdout: localBranchStr } = await runCommand('git branch --list --no-color', workspaceRoot);
     const localBranches = new Set(localBranchStr.split('\n').map(b => b.trim().replace('* ', '')).filter(b => b));
     const currentBranch = await getCurrentBranch(workspaceRoot);
-    const { stdout: localCommitsResult } = await runCommand('git rev-list --all --pretty=format:%H', workspaceRoot);
-    const localCommitSet = new Set(localCommitsResult.trim().split(/\s+/));
 
-    // 3. Group bundles by branch for commits we don't have yet
+    // 3. Group all remote bundles by branch name
     const remoteBundlesByBranch = new Map();
     for (const bundle of allRemoteBundles) {
         const parts = bundle.name.split('--');
         if (parts.length < 2) continue;
         const branchName = parts[0];
-        const commitHash = parts[1].replace('.bundle', '');
-        if (!commitHash || localCommitSet.has(commitHash)) {
-            continue;
-        }
-
+        
         if (!remoteBundlesByBranch.has(branchName)) {
             remoteBundlesByBranch.set(branchName, []);
         }
         remoteBundlesByBranch.get(branchName).push(bundle);
     }
 
-    if (remoteBundlesByBranch.size === 0) {
-        vscode.window.showInformationMessage('Local repository is up-to-date.');
-        return;
-    }
-
     const tempDir = path.join(workspaceRoot, '.git', 'gdrive-temp-bundles');
     await fs.mkdir(tempDir, { recursive: true });
     let changesMade = false;
+    let newCommitsFound = false;
 
     try {
         for (const [branchName, bundles] of remoteBundlesByBranch.entries()) {
@@ -761,8 +751,22 @@ async function pullCommits(context) {
                 // --- Logic for EXISTING branches (only the current one for now) ---
                 if (branchName !== currentBranch) continue;
 
-                vscode.window.showInformationMessage(`Found ${bundles.length} new commit(s) for current branch '${branchName}'. Fetching...`);
-                for (const bundle of bundles) {
+                // Get commits for the current branch to find what's new
+                const { stdout: currentBranchCommitsResult } = await runCommand(`git rev-list ${branchName}`, workspaceRoot);
+                const currentBranchCommitSet = new Set(currentBranchCommitsResult.trim().split(/\s+/));
+                
+                const newBundles = bundles.filter(bundle => {
+                    const commitHash = bundle.name.split('--')[1]?.replace('.bundle', '');
+                    return commitHash && !currentBranchCommitSet.has(commitHash);
+                });
+
+                if (newBundles.length === 0) {
+                    continue; // No new commits for this branch
+                }
+                newCommitsFound = true;
+
+                vscode.window.showInformationMessage(`Found ${newBundles.length} new commit(s) for current branch '${branchName}'. Fetching...`);
+                for (const bundle of newBundles) {
                     const tempBundlePath = path.join(tempDir, bundle.name);
                     await downloadFile(drive, bundle.id, tempBundlePath);
                     await runCommand(`git fetch "${tempBundlePath}"`, workspaceRoot);
@@ -777,6 +781,7 @@ async function pullCommits(context) {
 
             } else {
                 // --- Logic for NEW branches ---
+                newCommitsFound = true;
                 const choice = await vscode.window.showInformationMessage(
                     `Found new remote branch '${branchName}' with ${bundles.length} new commit(s). Create local branch?`,
                     { modal: true },
@@ -814,8 +819,10 @@ async function pullCommits(context) {
 
     if (changesMade) {
         vscode.window.showInformationMessage('Pull from Google Drive finished.');
-    } else {
+    } else if (newCommitsFound) {
         vscode.window.showInformationMessage('No new changes to pull for current branch or any new branches.');
+    } else {
+        vscode.window.showInformationMessage('Local repository is up-to-date.');
     }
 }
 
