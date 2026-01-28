@@ -675,7 +675,8 @@ async function pushCommits(context) {
         return;
     }
 
-    const bundleFileName = `${currentBranch}--${currentHead}.bundle`;
+    const sanitizedBranchName = sanitizeBranchNameForDrive(currentBranch);
+    const bundleFileName = `${sanitizedBranchName}--${currentHead}.bundle`;
     const bundlePath = path.join(workspaceRoot, '.git', bundleFileName);
 
     try {
@@ -732,7 +733,8 @@ async function pullCommits(context) {
     for (const bundle of allRemoteBundles) {
         const parts = bundle.name.split('--');
         if (parts.length < 2) continue;
-        const branchName = parts[0];
+        const driveBranchName = parts[0];
+        const branchName = restoreBranchNameFromDrive(driveBranchName);
         
         if (!remoteBundlesByBranch.has(branchName)) {
             remoteBundlesByBranch.set(branchName, []);
@@ -922,7 +924,8 @@ async function cloneFromGoogleDrive(context) {
         const cloneTempDir = path.join(tempDir, 'cloned');
         await runCommand(`git clone \"${tempBundlePath}\" \"${cloneTempDir}\"`, tempDir);
 
-        const [branchToCheckout, clonedHead] = selectedBundle.label.replace('.bundle', '').split('--');
+        const [driveBranchName, clonedHead] = selectedBundle.label.replace('.bundle', '').split('--');
+        const branchToCheckout = restoreBranchNameFromDrive(driveBranchName);
 
         const clonedFiles = await fs.readdir(cloneTempDir);
         for (const file of clonedFiles) {
@@ -1324,6 +1327,20 @@ async function updateFile(drive, fileId, filePath, machineId) {
         media: media,
         fields: 'id',
     });
+}
+
+// Функция для преобразования имени ветки при сохранении на Google Drive
+// Заменяет слеши на подчеркивания
+function sanitizeBranchNameForDrive(branchName) {
+    if (!branchName) return "";
+    return branchName.replace(/\//g, '_');
+}
+
+// Функция для обратного преобразования имени ветки при загрузке с Google Drive
+// Заменяет подчеркивания на слеши
+function restoreBranchNameFromDrive(driveBranchName) {
+    if (!driveBranchName) return "";
+    return driveBranchName.replace(/_/g, '/');
 }
 
 function getWorkspaceRoot() {
