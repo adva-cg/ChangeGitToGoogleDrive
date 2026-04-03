@@ -26,11 +26,8 @@ function escapeGdriveQueryParam(param) {
 
 function activate(context) {
     // --- ГЕНЕРАЦИЯ MACHINE ID ---
-    let machineId = context.globalState.get(MACHINE_ID_KEY);
-    if (!machineId) {
-        machineId = vscode.env.machineId;
-        context.globalState.update(MACHINE_ID_KEY, machineId);
-    }
+    // Используем встроенный в VS Code ID машины напрямую, чтобы он не синхронизировался
+    const machineId = vscode.env.machineId;
 
     // --- РЕГИСТРАЦИЯ КОМАНД ---
     context.subscriptions.push(
@@ -1107,6 +1104,12 @@ async function authenticateWithGoogle(context) {
             res.end('Authentication successful! You can close this tab.');
             server.close();
             const { tokens } = await oauth2Client.getToken(code);
+            
+            if (!tokens.refresh_token) {
+                console.warn('Refresh token was not returned by Google. This might happen if you did not provide full consent OR if you have already authenticated before. If you experience frequent logouts, try revoking access in Google Account settings and re-authenticating.');
+                vscode.window.showWarningMessage('Google не прислал "refresh_token". Это может привести к частым запросам авторизации. Если сессии будут слетать, попробуйте сначала "Выйти" в настройках аккаунта Google для приложения "VSCode Git Sync".');
+            }
+
             await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(tokens));
             vscode.window.showInformationMessage('Successfully authenticated with Google.');
         } catch (e) {
@@ -1152,7 +1155,7 @@ async function getAuthenticatedClient(context) {
             await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(newTokens));
             oauth2Client.setCredentials(newTokens);
         } catch (error) {
-            vscode.window.showErrorMessage(`Failed to refresh token: ${error.message}. Please run the 'Authenticate with Google' command again.`);
+            vscode.window.showErrorMessage(`Failed to refresh token: ${error.message}. Please run the 'Authenticate with Google' command again. IMPORTANT: Make sure you are using the same client_secret.json as on your other computer!`);
             return null;
         }
     }
