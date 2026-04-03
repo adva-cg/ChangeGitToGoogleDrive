@@ -18,6 +18,7 @@ const GOOGLE_DRIVE_TOKENS_KEY = 'googleDriveTokens';
 const LAST_PUSHED_HASH_KEY_PREFIX = 'lastPushedHash_'; // Prefix + branch name
 const MACHINE_ID_KEY = 'machineId';
 const CONFLICT_DECISIONS_KEY = 'conflictDecisions';
+const PROCESSED_TOMBSTONES_KEY = 'processedBranchTombstones';
 
 function escapeGdriveQueryParam(param) {
     if (!param) return "";
@@ -85,6 +86,132 @@ function activate(context) {
         watcher.onDidCreate(debouncedUpload);
         context.subscriptions.push(watcher);
     }
+
+    // --- МОНИТОРИНГ ВЕТОК ГИТА ---
+    setupBranchMonitoring(context);
+}
+
+let lastKnownBranches = new Set();
+
+async function setupBranchMonitoring(context) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
+
+    // Инициализация начального списка веток
+    try {
+        const branches = await getLocalBranches(workspaceRoot);
+        lastKnownBranches = new Set(branches);
+    } catch (e) {
+        console.error('Failed to initialize branch list:', e);
+    }
+
+    // Используем расширение Git для отслеживания изменений
+    const gitExtension = vscode.extensions.getExtension('vscode.git');
+    if (gitExtension) {
+        const api = gitExtension.exports.getAPI(1);
+        api.onDidOpenRepository(repo => subscribeToRepo(repo, context));
+        api.repositories.forEach(repo => subscribeToRepo(repo, context));
+    } else {
+        // Fallback: периодическая проверка, если расширение Git не найдено (маловероятно в VS Code)
+        setInterval(() => checkForBranchChanges(context), 30000);
+    }
+}
+
+function subscribeToRepo(repo, context) {
+    repo.state.onDidChange(() => checkForBranchChanges(context));
+}
+
+async function checkForBranchChanges(context) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
+
+    try {
+        const currentBranches = await getLocalBranches(workspaceRoot);
+        const currentBranchesSet = new Set(currentBranches);
+
+        // Поиск удаленных веток
+        for (const branch of lastKnownBranches) {
+            if (!currentBranchesSet.has(branch)) {
+                // Ветка была удалена!
+                offerToDeleteBranchFromDrive(context, branch);
+            }
+        }
+
+        lastKnownBranches = currentBranchesSet;
+    } catch (e) {
+        console.error('Error checking for branch changes:', e);
+    }
+}
+
+async function getLocalBranches(workspaceRoot) {
+    const { stdout } = await runCommand('git branch --list --no-color', workspaceRoot);
+    return stdout.split('\n')
+        .map(b => b.trim().replace('* ', ''))
+        .filter(b => b && !b.startsWith('(')); // Игнорируем "(HEAD detached at...)"
+}
+
+async function offerToDeleteBranchFromDrive(context, branchName) {
+    const choice = await vscode.window.showInformationMessage(
+        `Ветка '${branchName}' была удалена локально. Удалить её бандлы из Google Drive и уведомить другие компьютеры?`,
+        'Да', 'Нет'
+    );
+
+    if (choice === 'Да') {
+        await deleteBranchFromDrive(context, branchName);
+    }
+}
+
+async function deleteBranchFromDrive(context, branchName) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
+
+    const drive = await getAuthenticatedClient(context);
+    if (!drive) return;
+
+    vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: `Удаление ветки '${branchName}' из Google Drive...`,
+        cancellable: false
+    }, async (progress) => {
+        try {
+            const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
+            const sanitizedName = sanitizeBranchNameForDrive(branchName);
+            
+            // 1. Поиск и удаление бандлов
+            const q = `'${bundleFolderId}' in parents and name contains '${sanitizedName}--' and trashed=false`;
+            const { data: { files } } = await drive.files.list({ q, fields: 'files(id, name)' });
+            
+            for (const file of files) {
+                // Дополнительная проверка, чтобы точно совпало начало имени (префикс ветки)
+                if (file.name.startsWith(`${sanitizedName}--`)) {
+                    await drive.files.update({ fileId: file.id, resource: { trashed: true } });
+                }
+            }
+
+            // 2. Создание надгробия (tombstone) для ветки
+            const tombstonesFolderId = await findOrCreateTombstonesFolder(drive, workspaceRoot);
+            const branchTombstonesFolderId = await findOrCreateSubFolder(drive, tombstonesFolderId, 'branches');
+            
+            await drive.files.create({
+                resource: {
+                    name: sanitizedName,
+                    parents: [branchTombstonesFolderId],
+                    mimeType: 'text/plain'
+                },
+                media: {
+                    mimeType: 'text/plain',
+                    body: `Deleted at ${new Date().toISOString()}`
+                }
+            });
+
+            // 3. Очистка локального состояния
+            await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${branchName}`, undefined);
+            
+            vscode.window.showInformationMessage(`Ветка '${branchName}' успешно удалена из Google Drive.`);
+        } catch (error) {
+            vscode.window.showErrorMessage(`Ошибка при удалении ветки '${branchName}' из Google Drive: ${error.message}`);
+        }
+    });
 }
 
 // --- КОМАНДЫ УПРАВЛЕНИЯ НЕОТСЛЕЖИВАЕМЫМИ ФАЙЛАМИ ---
@@ -624,11 +751,73 @@ async function initialUpload(context) {
 async function sync(context) {
     vscode.window.showInformationMessage('Syncing with Google Drive...');
     try {
+        await checkRemoteBranchTombstones(context);
         await pullCommits(context);
         await pushCommits(context);
         vscode.window.showInformationMessage('Sync finished.');
     } catch (error) {
         vscode.window.showErrorMessage(`Sync failed: ${error.message}`);
+    }
+}
+
+async function checkRemoteBranchTombstones(context) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
+
+    const drive = await getAuthenticatedClient(context);
+    if (!drive) return;
+
+    try {
+        const tombstonesFolderId = await findOrCreateTombstonesFolder(drive, workspaceRoot);
+        const branchTombstonesFolderId = await findOrCreateSubFolder(drive, tombstonesFolderId, 'branches');
+        
+        const { data: { files: tombstones } } = await drive.files.list({
+            q: `'${branchTombstonesFolderId}' in parents and trashed=false`,
+            fields: 'files(id, name)'
+        });
+
+        if (!tombstones || tombstones.length === 0) return;
+
+        const localBranches = await getLocalBranches(workspaceRoot);
+        const processedTombstones = context.workspaceState.get(PROCESSED_TOMBSTONES_KEY, {});
+        
+        for (const tombstone of tombstones) {
+            const branchName = restoreBranchNameFromDrive(tombstone.name);
+            
+            // Если ветка есть локально и мы еще не обрабатывали это надгробие
+            if (localBranches.includes(branchName) && !processedTombstones[tombstone.id]) {
+                const choice = await vscode.window.showWarningMessage(
+                    `Ветка '${branchName}' была удалена на другом компьютере. Удалить её локально?`,
+                    'Да', 'Нет'
+                );
+
+                if (choice === 'Да') {
+                    try {
+                        await runCommand(`git branch -D ${branchName}`, workspaceRoot);
+                        vscode.window.showInformationMessage(`Ветка '${branchName}' удалена локально.`);
+                        
+                        // Если удалили текущую ветку, переключаемся на main/master
+                        const current = await getCurrentBranch(workspaceRoot);
+                        if (current === branchName) {
+                            const defaultBranch = localBranches.includes('main') ? 'main' : (localBranches.includes('master') ? 'master' : null);
+                            if (defaultBranch) {
+                                await runCommand(`git checkout ${defaultBranch}`, workspaceRoot);
+                                vscode.window.showInformationMessage(`Переключено на '${defaultBranch}'.`);
+                            }
+                        }
+                    } catch (e) {
+                        vscode.window.showErrorMessage(`Не удалось удалить ветку '${branchName}': ${e.message}`);
+                    }
+                }
+                
+                // Запоминаем, что обработали это надгробие (даже если пользователь выбрал "Нет")
+                processedTombstones[tombstone.id] = true;
+            }
+        }
+        
+        await context.workspaceState.update(PROCESSED_TOMBSTONES_KEY, processedTombstones);
+    } catch (error) {
+        console.error('Error checking remote branch tombstones:', error);
     }
 }
 
@@ -1165,49 +1354,35 @@ async function getAuthenticatedClient(context) {
 // --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 async function findOrCreateProjectFolders(drive, workspaceRoot) {
-    const projectName = path.basename(workspaceRoot);
-    const gdriveGitDir = `.gdrive-git`;
-
-    let { data: { files: rootFolders } } = await drive.files.list({ q: `name='${gdriveGitDir}' and mimeType='application/vnd.google-apps.folder' and trashed=false`, fields: 'files(id)' });
-    let rootFolderId;
-    if (rootFolders.length === 0) {
-        const { data } = await drive.files.create({ resource: { name: gdriveGitDir, mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' });
-        rootFolderId = data.id;
-    } else {
-        rootFolderId = rootFolders[0].id;
-    }
-
-    const q = `name='${escapeGdriveQueryParam(projectName)}' and mimeType='application/vnd.google-apps.folder' and '${rootFolderId}' in parents and trashed=false`;
-    let { data: { files: projectFolders } } = await drive.files.list({ q: q, fields: 'files(id)' });
-    let projectFolderId;
-    if (projectFolders.length === 0) {
-        const { data } = await drive.files.create({ resource: { name: projectName, mimeType: 'application/vnd.google-apps.folder', parents: [rootFolderId] }, fields: 'id' });
-        projectFolderId = data.id;
-    } else {
-        projectFolderId = projectFolders[0].id;
-    }
-
-    const bundlesDir = `bundles`;
-    let { data: { files: bundlesFolders } } = await drive.files.list({ q: `name='${bundlesDir}' and mimeType='application/vnd.google-apps.folder' and '${projectFolderId}' in parents and trashed=false`, fields: 'files(id)' });
-    let bundlesFolderId;
-    if (bundlesFolders.length === 0) {
-        const { data } = await drive.files.create({ resource: { name: bundlesDir, mimeType: 'application/vnd.google-apps.folder', parents: [projectFolderId] }, fields: 'id' });
-        bundlesFolderId = data.id;
-    } else {
-        bundlesFolderId = bundlesFolders[0].id;
-    }
-
-    return bundlesFolderId;
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot);
+    return await findOrCreateSubFolder(drive, projectFolderId, 'bundles');
 }
 
 async function findOrCreateUntrackedFilesFolder(drive, workspaceRoot) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot);
+    return await findOrCreateSubFolder(drive, projectFolderId, 'untracked');
+}
+
+async function findOrCreateTombstonesFolder(drive, workspaceRoot) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot);
+    return await findOrCreateSubFolder(drive, projectFolderId, 'tombstones');
+}
+
+async function findOrCreateBaseProjectFolder(drive, workspaceRoot) {
     const projectName = path.basename(workspaceRoot);
     const gdriveGitDir = `.gdrive-git`;
 
-    let { data: { files: rootFolders } } = await drive.files.list({ q: `name='${gdriveGitDir}' and mimeType='application/vnd.google-apps.folder' and trashed=false`, fields: 'files(id)' });
+    let { data: { files: rootFolders } } = await drive.files.list({ 
+        q: `name='${gdriveGitDir}' and mimeType='application/vnd.google-apps.folder' and trashed=false`, 
+        fields: 'files(id)' 
+    });
+    
     let rootFolderId;
     if (rootFolders.length === 0) {
-        const { data } = await drive.files.create({ resource: { name: gdriveGitDir, mimeType: 'application/vnd.google-apps.folder' }, fields: 'id' });
+        const { data } = await drive.files.create({ 
+            resource: { name: gdriveGitDir, mimeType: 'application/vnd.google-apps.folder' }, 
+            fields: 'id' 
+        });
         rootFolderId = data.id;
     } else {
         rootFolderId = rootFolders[0].id;
@@ -1215,25 +1390,31 @@ async function findOrCreateUntrackedFilesFolder(drive, workspaceRoot) {
 
     const q = `name='${escapeGdriveQueryParam(projectName)}' and mimeType='application/vnd.google-apps.folder' and '${rootFolderId}' in parents and trashed=false`;
     let { data: { files: projectFolders } } = await drive.files.list({ q: q, fields: 'files(id)' });
-    let projectFolderId;
-    if (projectFolders.length === 0) {
-        const { data } = await drive.files.create({ resource: { name: projectName, mimeType: 'application/vnd.google-apps.folder', parents: [rootFolderId] }, fields: 'id' });
-        projectFolderId = data.id;
-    } else {
-        projectFolderId = projectFolders[0].id;
-    }
     
-    const untrackedDir = `untracked`;
-    let { data: { files: untrackedFolders } } = await drive.files.list({ q: `name='${untrackedDir}' and mimeType='application/vnd.google-apps.folder' and '${projectFolderId}' in parents and trashed=false`, fields: 'files(id)' });
-    let untrackedFolderId;
-    if (untrackedFolders.length === 0) {
-        const { data } = await drive.files.create({ resource: { name: untrackedDir, mimeType: 'application/vnd.google-apps.folder', parents: [projectFolderId] }, fields: 'id' });
-        untrackedFolderId = data.id;
+    if (projectFolders.length === 0) {
+        const { data } = await drive.files.create({ 
+            resource: { name: projectName, mimeType: 'application/vnd.google-apps.folder', parents: [rootFolderId] }, 
+            fields: 'id' 
+        });
+        return data.id;
     } else {
-        untrackedFolderId = untrackedFolders[0].id;
+        return projectFolders[0].id;
     }
+}
 
-    return untrackedFolderId;
+async function findOrCreateSubFolder(drive, parentId, folderName) {
+    const q = `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`;
+    let { data: { files: folders } } = await drive.files.list({ q, fields: 'files(id)' });
+    
+    if (folders.length === 0) {
+        const { data } = await drive.files.create({ 
+            resource: { name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] }, 
+            fields: 'id' 
+        });
+        return data.id;
+    } else {
+        return folders[0].id;
+    }
 }
 
 async function uploadBundleFile(drive, filePath, parentFolderId) {
