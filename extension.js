@@ -1336,15 +1336,27 @@ async function getAuthenticatedClient(context) {
 
     if (oauth2Client.isTokenExpiring()) {
         try {
-            const { tokens: newTokens } = await oauth2Client.refreshAccessToken();
-            const oldTokens = JSON.parse(tokensStr);
-            if (oldTokens.refresh_token && !newTokens.refresh_token) {
-                newTokens.refresh_token = oldTokens.refresh_token;
+            const refreshRes = await oauth2Client.refreshAccessToken();
+            const newTokens = refreshRes ? refreshRes.tokens : null;
+            const oldTokens = JSON.parse(tokensStr || '{}');
+
+            if (newTokens) {
+                // Если Google не прислал refresh_token при обновлении (это частое поведение), сохраняем старый
+                if (oldTokens.refresh_token && !newTokens.refresh_token) {
+                    newTokens.refresh_token = oldTokens.refresh_token;
+                }
+                await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(newTokens));
+                oauth2Client.setCredentials(newTokens);
+            } else {
+                throw new Error("Google API returned an empty tokens response during refresh.");
             }
-            await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(newTokens));
-            oauth2Client.setCredentials(newTokens);
         } catch (error) {
-            vscode.window.showErrorMessage(`Failed to refresh token: ${error.message}. Please run the 'Authenticate with Google' command again. IMPORTANT: Make sure you are using the same client_secret.json as on your other computer!`);
+            console.error("ChangeGitToGoogleDrive: Failed to refresh token", error);
+            const detailedMessage = error.message.includes('invalid_grant') 
+                ? "Сессия Google отозвана или недействительна (invalid_grant). Возможно, из-за смены пароля или входа с другого устройства."
+                : error.message;
+            
+            vscode.window.showErrorMessage(`Failed to refresh token: ${detailedMessage}. Please run the 'Authenticate with Google' command again. (Check 'Toggle Developer Tools' for details)`);
             return null;
         }
     }
