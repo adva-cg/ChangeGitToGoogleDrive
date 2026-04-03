@@ -14,19 +14,7 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [
-    "onCommand:changegittogoogledrive-extension.setupGoogleCredentials",
-    "onCommand:changegittogoogledrive-extension.authenticateWithGoogle",
-    "onCommand:changegittogoogledrive-extension.initialUpload",
-    "onCommand:changegittogoogledrive-extension.sync",
-    "onCommand:changegittogoogledrive-extension.installGitHooks",
-    "onCommand:changegittogoogledrive-extension.cloneFromGoogleDrive",
-    "onCommand:changegittogoogledrive-extension.manageSyncHash",
-    "onCommand:changegittogoogledrive-extension.uploadUntrackedFiles",
-    "onCommand:changegittogoogledrive-extension.syncUntrackedFiles",
-    "onCommand:changegittogoogledrive-extension.deleteUntrackedFile",
-    "onCommand:changegittogoogledrive-extension.clearTombstones"
-  ],
+  "activationEvents": [],
   "main": "./extension.js",
   "contributes": {
     "commands": [
