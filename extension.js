@@ -97,6 +97,28 @@ function activate(context) {
     // --- ТРЕКИНГ ТЕКУЩЕЙ БЕСЕДЫ ---
     trackCurrentConversation(context);
 
+    // --- АВТОМАТИЧЕСКАЯ СИНХРОНИЗАЦИЯ ИСТОРИИ AI ПРИ ИЗМЕНЕНИИ ---
+    let aiHistorySyncTimeout;
+    const aiWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(AI_HISTORY_LOCAL_PATH), '**/*'));
+    
+    const debouncedAIHistorySync = () => {
+        clearTimeout(aiHistorySyncTimeout);
+        aiHistorySyncTimeout = setTimeout(() => {
+            const aiHistoryConfig = vscode.workspace.getConfiguration('changegittogoogledrive-extension.aiHistory');
+            const isEnabled = context.workspaceState.get(AI_HISTORY_ENABLED_KEY);
+            // Синхронизируем, если включено и не в режиме 'never'
+            if (isEnabled !== false && aiHistoryConfig.get('syncMode') !== 'never') {
+                console.log('Auto-syncing AI history after changes...');
+                syncAIHistory(context, true);
+            }
+        }, 60000); // 60 секунд тишины перед синхронизацией
+    };
+
+    aiWatcher.onDidChange(debouncedAIHistorySync);
+    aiWatcher.onDidCreate(debouncedAIHistorySync);
+    aiWatcher.onDidDelete(debouncedAIHistorySync);
+    context.subscriptions.push(aiWatcher);
+
     // --- МОНИТОРИНГ ВЕТОК ГИТА ---
     setupBranchMonitoring(context);
 }
