@@ -1257,6 +1257,209 @@ async function inputCommitHash() {
     return newHash === undefined ? null : newHash;
 }
 
+// --- КОМАНДЫ ДЛЯ СИНХРОНИЗАЦИИ ИСТОРИИ AI (Antigravity) ---
+
+async function trackCurrentConversation(context) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
+
+    try {
+        const conversationId = await getCurrentConversationId();
+        if (!conversationId) return;
+
+        let projectConversationIds = context.workspaceState.get(AI_HISTORY_IDS_KEY, []);
+        if (!projectConversationIds.includes(conversationId)) {
+            projectConversationIds.push(conversationId);
+            await context.workspaceState.update(AI_HISTORY_IDS_KEY, projectConversationIds);
+            console.log(`Associated conversation ${conversationId} with this project.`);
+        }
+    } catch (e) {
+        console.error('Error tracking current conversation:', e);
+    }
+}
+
+async function getCurrentConversationId() {
+    // В идеале мы берем ID из окружения Antigravity, 
+    // но как fallback - находим самую свежую папку в brain
+    try {
+        const folders = await fs.readdir(AI_HISTORY_LOCAL_PATH);
+        if (folders.length === 0) return null;
+
+        const folderDetails = await Promise.all(folders.map(async name => {
+            const stats = await fs.stat(path.join(AI_HISTORY_LOCAL_PATH, name));
+            return { name, mtime: stats.mtime };
+        }));
+
+        folderDetails.sort((a, b) => b.mtime - a.mtime);
+        return folderDetails[0].name; // Самая свежая беседа
+    } catch (e) {
+        return null;
+    }
+}
+
+async function configureAIHistorySync(context) {
+    const choice = await vscode.window.showQuickPick([
+        { label: "Включить", description: "Синхронизировать историю для этого проекта", action: "enable" },
+        { label: "Отключить", description: "Никогда не синхронизировать для этого проекта", action: "disable" },
+        { label: "Сбросить выбор", description: "Спрашивать при следующей синхронизации", action: "reset" }
+    ], { placeHolder: "Настроить синхронизацию истории AI (Antigravity)" });
+
+    if (!choice) return;
+
+    switch (choice.action) {
+        case "enable":
+            await context.workspaceState.update(AI_HISTORY_ENABLED_KEY, true);
+            vscode.window.showInformationMessage('Синхронизация истории AI включена для этого проекта.');
+            await syncAIHistory(context, false);
+            break;
+        case "disable":
+            await context.workspaceState.update(AI_HISTORY_ENABLED_KEY, false);
+            vscode.window.showInformationMessage('Синхронизация истории AI отключена для этого проекта.');
+            break;
+        case "reset":
+            await context.workspaceState.update(AI_HISTORY_ENABLED_KEY, undefined);
+            vscode.window.showInformationMessage('Выбор сброшен. Antigravity спросит вас при следующей попытке синхронизации.');
+            break;
+    }
+}
+
+async function syncAIHistory(context, silent = false) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) return;
+
+    let isEnabled = context.workspaceState.get(AI_HISTORY_ENABLED_KEY);
+    
+    if (isEnabled === false) {
+        if (!silent) vscode.window.showInformationMessage('Синхронизация истории AI отключена для этого проекта в настройках рабочей области.');
+        return;
+    }
+
+    if (isEnabled === undefined) {
+        const choice = await vscode.window.showInformationMessage(
+            'Включить синхронизацию истории AI (Antigravity) для этого проекта?',
+            { modal: true },
+            'Да', 'Нет'
+        );
+        if (choice === 'Да') {
+            isEnabled = true;
+            await context.workspaceState.update(AI_HISTORY_ENABLED_KEY, true);
+        } else {
+            isEnabled = false;
+            await context.workspaceState.update(AI_HISTORY_ENABLED_KEY, false);
+            return;
+        }
+    }
+
+    const drive = await getAuthenticatedClient(context);
+    if (!drive) return;
+
+    if (!silent) vscode.window.showInformationMessage('Синхронизация истории AI с Google Drive...');
+
+    try {
+        const historyFolderId = await findOrCreateAIHistoryFolder(drive, workspaceRoot);
+        const manifestFileId = await findOrCreateAIHistoryManifest(drive, historyFolderId);
+        
+        // 1. Загружаем манифест с диска (чтобы узнать о чатах с других машин)
+        const { data: manifestContent } = await drive.files.get({ fileId: manifestFileId, alt: 'media' });
+        let remoteManifest = {};
+        try { 
+            // Обработка потока данных, если он пришел как объект
+            if (typeof manifestContent === 'object') {
+                remoteManifest = manifestContent;
+            } else if (typeof manifestContent === 'string') {
+                remoteManifest = JSON.parse(manifestContent);
+            }
+        } catch (e) {} 
+        
+        const projectConversationIds = context.workspaceState.get(AI_HISTORY_IDS_KEY, []);
+        const allRelevantIds = new Set([...projectConversationIds, ...(remoteManifest.ids || [])]);
+
+        const machineId = vscode.env.machineId;
+
+        for (const convId of allRelevantIds) {
+            const localPath = path.join(AI_HISTORY_LOCAL_PATH, convId);
+            const remoteConvFolderId = await findOrCreateSubFolder(drive, historyFolderId, convId);
+
+            if (fsSync.existsSync(localPath)) {
+                // Синхронизируем файлы внутри папки чата
+                await syncFolder(drive, localPath, remoteConvFolderId, machineId, silent);
+            } else {
+                // Если чата нет локально - скачиваем его
+                if (!silent) vscode.window.showInformationMessage(`Загрузка нового чата: ${convId}`);
+                await downloadFolder(drive, remoteConvFolderId, localPath, silent);
+            }
+        }
+
+        // 2. Обновляем манифест на диске, если добавились новые ID
+        const mergedIds = Array.from(allRelevantIds);
+        if (mergedIds.length > (remoteManifest.ids || []).length) {
+            await drive.files.update({
+                fileId: manifestFileId,
+                media: { mimeType: 'application/json', body: JSON.stringify({ ids: mergedIds }) }
+            });
+        }
+
+        if (!silent) vscode.window.showInformationMessage('Синхронизация истории AI завершена успешно.');
+    } catch (error) {
+        vscode.window.showErrorMessage(`Ошибка синхронизации истории AI: ${error.message}`);
+    }
+}
+
+async function syncFolder(drive, localPath, remoteFolderId, machineId, silent) {
+    const localFiles = await fs.readdir(localPath);
+    const remoteFiles = await getAllRemoteFiles(drive, remoteFolderId);
+
+    for (const file of localFiles) {
+        const localFilePath = path.join(localPath, file);
+        const stats = await fs.stat(localFilePath);
+        if (stats.isDirectory()) continue;
+
+        const localMd5 = await getFileMd5(localFilePath);
+        const remoteFile = remoteFiles.find(f => f.name === file);
+
+        if (remoteFile) {
+            if (localMd5 !== remoteFile.md5Checksum) {
+                const remoteMachineId = (remoteFile.appProperties && remoteFile.appProperties.machineId) ? remoteFile.appProperties.machineId : null;
+                if (remoteMachineId !== machineId) {
+                    await updateFile(drive, remoteFile.id, localFilePath, machineId);
+                }
+            }
+        } else {
+            await createFile(drive, remoteFolderId, localFilePath, file, machineId);
+        }
+    }
+}
+
+async function downloadFolder(drive, remoteFolderId, localPath, silent) {
+    const remoteFiles = await getAllRemoteFiles(drive, remoteFolderId);
+    for (const file of remoteFiles) {
+        const destPath = path.join(localPath, file.name);
+        await downloadFile(drive, file.id, destPath);
+    }
+}
+
+async function findOrCreateAIHistoryFolder(drive, workspaceRoot) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot);
+    return await findOrCreateSubFolder(drive, projectFolderId, 'ai-history');
+}
+
+async function findOrCreateAIHistoryManifest(drive, historyFolderId) {
+    const fileName = 'history_manifest.json';
+    const q = `name='${fileName}' and '${historyFolderId}' in parents and trashed=false`;
+    const { data: { files } } = await drive.files.list({ q, fields: 'files(id)' });
+
+    if (files.length > 0) {
+        return files[0].id;
+    } else {
+        const { data } = await drive.files.create({
+            resource: { name: fileName, parents: [historyFolderId], mimeType: 'application/json' },
+            media: { mimeType: 'application/json', body: JSON.stringify({ ids: [] }) },
+            fields: 'id'
+        });
+        return data.id;
+    }
+}
+
 // --- АУТЕНТИФИКАЦИЯ И УТИЛИТЫ GOOGLE DRIVE ---
 
 async function setupGoogleCredentials(context) {
