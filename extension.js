@@ -16,9 +16,10 @@ const REDIRECT_URI = 'http://localhost:8080/oauth2callback';
 const GOOGLE_DRIVE_CREDENTIALS_KEY = 'googleDriveCredentials';
 const GOOGLE_DRIVE_TOKENS_KEY = 'googleDriveTokens';
 const LAST_PUSHED_HASH_KEY_PREFIX = 'lastPushedHash_'; // Prefix + branch name
-const MACHINE_ID_KEY = 'machineId';
-const CONFLICT_DECISIONS_KEY = 'conflictDecisions';
 const PROCESSED_TOMBSTONES_KEY = 'processedBranchTombstones';
+const AI_HISTORY_ENABLED_KEY = 'aiHistoryEnabled'; // Stores true/false/undefined for the current project
+const AI_HISTORY_IDS_KEY = 'aiHistoryConversationIds'; // Array of IDs for the current project
+const AI_HISTORY_LOCAL_PATH = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
 
 function escapeGdriveQueryParam(param) {
     if (!param) return "";
@@ -42,7 +43,9 @@ function activate(context) {
         vscode.commands.registerCommand('changegittogoogledrive-extension.uploadUntrackedFiles', () => uploadUntrackedFiles(context, false)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.syncUntrackedFiles', () => syncUntrackedFiles(context, false)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.deleteUntrackedFile', () => deleteUntrackedFile(context)),
-        vscode.commands.registerCommand('changegittogoogledrive-extension.clearTombstones', () => clearTombstones(context))
+        vscode.commands.registerCommand('changegittogoogledrive-extension.clearTombstones', () => clearTombstones(context)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.syncAIHistory', () => syncAIHistory(context, false)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.configureAIHistorySync', () => configureAIHistorySync(context))
     );
 
     // --- РЕГИСТРАЦИЯ ОБРАБОТЧИКА URI ДЛЯ GIT HOOKS ---
@@ -63,6 +66,10 @@ function activate(context) {
     const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
     if (config.get('syncOnStartup')) {
         syncUntrackedFiles(context, true);
+    }
+    const aiConfig = vscode.workspace.getConfiguration('changegittogoogledrive-extension.aiHistory');
+    if (aiConfig.get('autoSync')) {
+        syncAIHistory(context, true);
     }
 
     // --- АВТОМАТИЧЕСКАЯ ВЫГРУЗКА НЕОТСЛЕЖИВАЕМЫХ ФАЙЛОВ ---
@@ -86,6 +93,9 @@ function activate(context) {
         watcher.onDidCreate(debouncedUpload);
         context.subscriptions.push(watcher);
     }
+
+    // --- ТРЕКИНГ ТЕКУЩЕЙ БЕСЕДЫ ---
+    trackCurrentConversation(context);
 
     // --- МОНИТОРИНГ ВЕТОК ГИТА ---
     setupBranchMonitoring(context);

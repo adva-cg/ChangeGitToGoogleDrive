@@ -2,7 +2,7 @@
   "name": "changegittogoogledrive-extension",
   "displayName": "ChangeGitToGoogleDrive",
   "description": "A VS Code extension to sync git commits as bundles with Google Drive",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "publisher": "VitalyAdadurov",
   "repository": {
     "type": "git",
@@ -14,7 +14,9 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./extension.js",
   "contributes": {
     "commands": [
@@ -72,6 +74,16 @@
         "command": "changegittogoogledrive-extension.clearTombstones",
         "title": "Неотслеживаемые файлы: Очистить корзину",
         "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.syncAIHistory",
+        "title": "Синхронизировать историю AI",
+        "category": "Git-To-Google-Drive"
+      },
+      {
+        "command": "changegittogoogledrive-extension.configureAIHistorySync",
+        "title": "Настроить синхронизацию истории AI для этого проекта",
+        "category": "Git-To-Google-Drive"
       }
     ],
     "configuration": {
@@ -96,6 +108,21 @@
           "type": "array",
           "default": [],
           "description": "Массив glob-шаблонов для исключения файлов из синхронизации. Имеет приоритет над 'include'."
+        },
+        "changegittogoogledrive-extension.aiHistory.syncMode": {
+          "type": "string",
+          "default": "ask",
+          "enum": [
+            "ask",
+            "always",
+            "never"
+          ],
+          "description": "Как синхронизировать историю бесед AI (Antigravity). 'ask' - спрашивать для каждого проекта."
+        },
+        "changegittogoogledrive-extension.aiHistory.autoSync": {
+          "type": "boolean",
+          "default": false,
+          "description": "Автоматически синхронизировать историю AI при запуске VS Code."
         }
       }
     }
