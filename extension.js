@@ -788,7 +788,7 @@ async function sync(context) {
         await pushCommits(context);
         vscode.window.showInformationMessage('Sync finished.');
     } catch (error) {
-        vscode.window.showErrorMessage(`Sync failed: ${error.message}`);
+        vscode.window.showErrorMessage(`Sync failed: ${error.message}`, { modal: true });
     }
 }
 
@@ -1181,7 +1181,7 @@ async function cloneFromGoogleDrive(context) {
         vscode.commands.executeCommand('workbench.action.reloadWindow');
 
     } catch (error) {
-        vscode.window.showErrorMessage(`Clone failed: ${error.message}`);
+        vscode.window.showErrorMessage(`Clone failed: ${error.message}`, { modal: true });
         const tempDir = path.join(workspaceRoot, '.gdrive-temp-clone');
         if (fsSync.existsSync(tempDir)) {
             await fs.rm(tempDir, { recursive: true, force: true });
@@ -1571,19 +1571,19 @@ async function getAuthenticatedClient(context) {
 
     if (oauth2Client.isTokenExpiring()) {
         try {
-            const refreshRes = await oauth2Client.refreshAccessToken();
-            const newTokens = refreshRes ? refreshRes.tokens : null;
+            // refreshAccessToken возвращает новые токены напрямую (Credentials)
+            const newTokens = await oauth2Client.refreshAccessToken();
             const oldTokens = JSON.parse(tokensStr || '{}');
 
-            if (newTokens) {
-                // Если Google не прислал refresh_token при обновлении (это частое поведение), сохраняем старый
+            if (newTokens && newTokens.access_token) {
+                // Если Google не прислал refresh_token при обновлении (это стандартное поведение), сохраняем старый
                 if (oldTokens.refresh_token && !newTokens.refresh_token) {
                     newTokens.refresh_token = oldTokens.refresh_token;
                 }
                 await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(newTokens));
                 oauth2Client.setCredentials(newTokens);
             } else {
-                throw new Error("Google API returned an empty tokens response during refresh.");
+                throw new Error("Google API returned an invalid response during refresh.");
             }
         } catch (error) {
             console.error("ChangeGitToGoogleDrive: Failed to refresh token", error);
@@ -1591,7 +1591,10 @@ async function getAuthenticatedClient(context) {
                 ? "Сессия Google отозвана или недействительна (invalid_grant). Возможно, из-за смены пароля или входа с другого устройства."
                 : error.message;
             
-            vscode.window.showErrorMessage(`Failed to refresh token: ${detailedMessage}. Please run the 'Authenticate with Google' command again. (Check 'Toggle Developer Tools' for details)`);
+            vscode.window.showErrorMessage(
+                `Failed to refresh token: ${detailedMessage}. Please run the 'Authenticate with Google' command again. (Check 'Toggle Developer Tools' for details)`,
+                { modal: true }
+            );
             return null;
         }
     }
