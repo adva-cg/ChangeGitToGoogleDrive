@@ -100,7 +100,7 @@ function activate(context) {
     // --- АВТОМАТИЧЕСКАЯ СИНХРОНИЗАЦИЯ ИСТОРИИ AI ПРИ ИЗМЕНЕНИИ ---
     let aiHistorySyncTimeout;
     const aiWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(AI_HISTORY_LOCAL_PATH), '**/*'));
-    
+
     const debouncedAIHistorySync = () => {
         clearTimeout(aiHistorySyncTimeout);
         aiHistorySyncTimeout = setTimeout(() => {
@@ -208,11 +208,11 @@ async function deleteBranchFromDrive(context, branchName) {
         try {
             const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
             const sanitizedName = sanitizeBranchNameForDrive(branchName);
-            
+
             // 1. Поиск и удаление бандлов
             const q = `'${bundleFolderId}' in parents and name contains '${sanitizedName}--' and trashed=false`;
             const { data: { files } } = await drive.files.list({ q, fields: 'files(id, name)' });
-            
+
             for (const file of files) {
                 // Дополнительная проверка, чтобы точно совпало начало имени (префикс ветки)
                 if (file.name.startsWith(`${sanitizedName}--`)) {
@@ -223,7 +223,7 @@ async function deleteBranchFromDrive(context, branchName) {
             // 2. Создание надгробия (tombstone) для ветки
             const tombstonesFolderId = await findOrCreateTombstonesFolder(drive, workspaceRoot);
             const branchTombstonesFolderId = await findOrCreateSubFolder(drive, tombstonesFolderId, 'branches');
-            
+
             await drive.files.create({
                 resource: {
                     name: sanitizedName,
@@ -238,7 +238,7 @@ async function deleteBranchFromDrive(context, branchName) {
 
             // 3. Очистка локального состояния
             await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${branchName}`, undefined);
-            
+
             vscode.window.showInformationMessage(`Ветка '${branchName}' успешно удалена из Google Drive.`);
         } catch (error) {
             vscode.window.showErrorMessage(`Ошибка при удалении ветки '${branchName}' из Google Drive: ${error.message}`);
@@ -347,7 +347,7 @@ async function clearTombstones(context) {
             return;
         }
         const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId);
-        
+
         const tombstones = await getAllRemoteFiles(drive, deletedFolderId, true);
 
         if (tombstones.length === 0) {
@@ -471,7 +471,7 @@ async function syncUntrackedFiles(context, silent = false) {
         const excludePatterns = config.get('exclude', []);
 
         const remoteFiles = await getAllRemoteFiles(drive, untrackedFolderId);
-        
+
         // 1. Предложить добавить правила для новых файлов с диска
         for (const remoteFile of remoteFiles) {
             const localPath = path.join(workspaceRoot, remoteFile.name);
@@ -489,9 +489,9 @@ async function syncUntrackedFiles(context, silent = false) {
                 );
 
                 if (choice === 'Да, добавить') {
-                    const newPattern = await vscode.window.showInputBox({ 
+                    const newPattern = await vscode.window.showInputBox({
                         prompt: 'Введите glob-шаблон для добавления в настройки',
-                        value: remoteFile.name 
+                        value: remoteFile.name
                     });
                     if (newPattern) {
                         const newPatterns = [...includePatterns, newPattern];
@@ -534,7 +534,7 @@ async function syncUntrackedFiles(context, silent = false) {
         }
 
         // 3. Обработать остальные файлы
-        const machineId = context.globalState.get(MACHINE_ID_KEY);
+        const machineId = vscode.env.machineId;
         for (const remoteFile of remoteFiles) {
             const isIncluded = includePatterns.some(p => minimatch(remoteFile.name, p));
             const isExcluded = excludePatterns.some(p => minimatch(remoteFile.name, p));
@@ -573,7 +573,7 @@ async function syncUntrackedFiles(context, silent = false) {
                                     await downloadFile(drive, remoteFile.id, tempRemotePath);
                                     await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(tempRemotePath), vscode.Uri.file(localPath), `${remoteFile.name} (Google Drive) ↔ (Локальный)`);
                                 } finally {
-                                    if(fsSync.existsSync(tempRemotePath)) await fs.unlink(tempRemotePath);
+                                    if (fsSync.existsSync(tempRemotePath)) await fs.unlink(tempRemotePath);
                                 }
                             } else {
                                 break;
@@ -654,7 +654,7 @@ async function uploadUntrackedFiles(context, silent = false) {
             return;
         }
 
-        const machineId = context.globalState.get(MACHINE_ID_KEY);
+        const machineId = vscode.env.machineId;
 
         for (const relativePath of filesToUpload) {
             const absolutePath = path.join(workspaceRoot, relativePath);
@@ -720,7 +720,7 @@ async function uploadUntrackedFiles(context, silent = false) {
                                     await downloadFile(drive, remoteFile.id, tempRemotePath);
                                     await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(tempRemotePath), vscode.Uri.file(absolutePath), `${relativePath} (Google Drive) ↔ (Локальный)`);
                                 } finally {
-                                    if(fsSync.existsSync(tempRemotePath)) await fs.unlink(tempRemotePath);
+                                    if (fsSync.existsSync(tempRemotePath)) await fs.unlink(tempRemotePath);
                                 }
                             } else {
                                 break;
@@ -802,7 +802,7 @@ async function checkRemoteBranchTombstones(context) {
     try {
         const tombstonesFolderId = await findOrCreateTombstonesFolder(drive, workspaceRoot);
         const branchTombstonesFolderId = await findOrCreateSubFolder(drive, tombstonesFolderId, 'branches');
-        
+
         const { data: { files: tombstones } } = await drive.files.list({
             q: `'${branchTombstonesFolderId}' in parents and trashed=false`,
             fields: 'files(id, name)'
@@ -812,10 +812,10 @@ async function checkRemoteBranchTombstones(context) {
 
         const localBranches = await getLocalBranches(workspaceRoot);
         const processedTombstones = context.workspaceState.get(PROCESSED_TOMBSTONES_KEY, {});
-        
+
         for (const tombstone of tombstones) {
             const branchName = restoreBranchNameFromDrive(tombstone.name);
-            
+
             // Если ветка есть локально и мы еще не обрабатывали это надгробие
             if (localBranches.includes(branchName) && !processedTombstones[tombstone.id]) {
                 const choice = await vscode.window.showWarningMessage(
@@ -827,7 +827,7 @@ async function checkRemoteBranchTombstones(context) {
                     try {
                         await runCommand(`git branch -D ${branchName}`, workspaceRoot);
                         vscode.window.showInformationMessage(`Ветка '${branchName}' удалена локально.`);
-                        
+
                         // Если удалили текущую ветку, переключаемся на main/master
                         const current = await getCurrentBranch(workspaceRoot);
                         if (current === branchName) {
@@ -841,12 +841,12 @@ async function checkRemoteBranchTombstones(context) {
                         vscode.window.showErrorMessage(`Не удалось удалить ветку '${branchName}': ${e.message}`);
                     }
                 }
-                
+
                 // Запоминаем, что обработали это надгробие (даже если пользователь выбрал "Нет")
                 processedTombstones[tombstone.id] = true;
             }
         }
-        
+
         await context.workspaceState.update(PROCESSED_TOMBSTONES_KEY, processedTombstones);
     } catch (error) {
         console.error('Error checking remote branch tombstones:', error);
@@ -953,7 +953,7 @@ async function pullCommits(context) {
         if (parts.length < 2) continue;
         const driveBranchName = parts[0];
         const branchName = restoreBranchNameFromDrive(driveBranchName);
-        
+
         if (!remoteBundlesByBranch.has(branchName)) {
             remoteBundlesByBranch.set(branchName, []);
         }
@@ -974,7 +974,7 @@ async function pullCommits(context) {
                 // Get commits for the current branch to find what's new
                 const { stdout: currentBranchCommitsResult } = await runCommand(`git rev-list ${branchName}`, workspaceRoot);
                 const currentBranchCommitSet = new Set(currentBranchCommitsResult.trim().split(/\s+/));
-                
+
                 const newBundles = bundles.filter(bundle => {
                     const commitHash = bundle.name.split('--')[1]?.replace('.bundle', '');
                     return commitHash && !currentBranchCommitSet.has(commitHash);
@@ -1052,7 +1052,7 @@ async function installGitHooks(context) {
 
     const hooksDir = path.join(workspaceRoot, '.git', 'hooks');
     const postCommitHookPath = path.join(hooksDir, 'post-commit');
-    const extensionId = 'user.changegittogoogledrive-extension'; 
+    const extensionId = 'user.changegittogoogledrive-extension';
 
     const postCommitScript = `#!/bin/sh\n# Hook to trigger VS Code sync after commit\nif command -v code >/dev/null 2>&1; then\n  code --open-url "vscode://${extensionId}/sync"\nelse\n  echo "VS Code command 'code' not found in PATH. Cannot trigger sync."\nfi\n`;
 
@@ -1350,7 +1350,7 @@ async function syncAIHistory(context, silent = false) {
     if (!workspaceRoot) return;
 
     let isEnabled = context.workspaceState.get(AI_HISTORY_ENABLED_KEY);
-    
+
     if (isEnabled === false) {
         if (!silent) vscode.window.showInformationMessage('Синхронизация истории AI отключена для этого проекта в настройках рабочей области.');
         return;
@@ -1380,19 +1380,19 @@ async function syncAIHistory(context, silent = false) {
     try {
         const historyFolderId = await findOrCreateAIHistoryFolder(drive, workspaceRoot);
         const manifestFileId = await findOrCreateAIHistoryManifest(drive, historyFolderId);
-        
+
         // 1. Загружаем манифест с диска (чтобы узнать о чатах с других машин)
         const { data: manifestContent } = await drive.files.get({ fileId: manifestFileId, alt: 'media' });
         let remoteManifest = {};
-        try { 
+        try {
             // Обработка потока данных, если он пришел как объект
             if (typeof manifestContent === 'object') {
                 remoteManifest = manifestContent;
             } else if (typeof manifestContent === 'string') {
                 remoteManifest = JSON.parse(manifestContent);
             }
-        } catch (e) {} 
-        
+        } catch (e) { }
+
         const projectConversationIds = context.workspaceState.get(AI_HISTORY_IDS_KEY, []);
         const allRelevantIds = new Set([...projectConversationIds, ...(remoteManifest.ids || [])]);
 
@@ -1528,7 +1528,7 @@ async function authenticateWithGoogle(context) {
             res.end('Authentication successful! You can close this tab.');
             server.close();
             const { tokens } = await oauth2Client.getToken(code);
-            
+
             if (!tokens.refresh_token) {
                 console.warn('Refresh token was not returned by Google. This might happen if you did not provide full consent OR if you have already authenticated before. If you experience frequent logouts, try revoking access in Google Account settings and re-authenticating.');
                 vscode.window.showWarningMessage('Google не прислал "refresh_token". Это может привести к частым запросам авторизации. Если сессии будут слетать, попробуйте сначала "Выйти" в настройках аккаунта Google для приложения "VSCode Git Sync".');
@@ -1587,10 +1587,10 @@ async function getAuthenticatedClient(context) {
             }
         } catch (error) {
             console.error("ChangeGitToGoogleDrive: Failed to refresh token", error);
-            const detailedMessage = error.message.includes('invalid_grant') 
+            const detailedMessage = error.message.includes('invalid_grant')
                 ? "Сессия Google отозвана или недействительна (invalid_grant). Возможно, из-за смены пароля или входа с другого устройства."
                 : error.message;
-            
+
             vscode.window.showErrorMessage(
                 `Failed to refresh token: ${detailedMessage}. Please run the 'Authenticate with Google' command again. (Check 'Toggle Developer Tools' for details)`,
                 { modal: true }
@@ -1622,16 +1622,16 @@ async function findOrCreateBaseProjectFolder(drive, workspaceRoot) {
     const projectName = path.basename(workspaceRoot);
     const gdriveGitDir = `.gdrive-git`;
 
-    let { data: { files: rootFolders } } = await drive.files.list({ 
-        q: `name='${gdriveGitDir}' and mimeType='application/vnd.google-apps.folder' and trashed=false`, 
-        fields: 'files(id)' 
+    let { data: { files: rootFolders } } = await drive.files.list({
+        q: `name='${gdriveGitDir}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+        fields: 'files(id)'
     });
-    
+
     let rootFolderId;
     if (rootFolders.length === 0) {
-        const { data } = await drive.files.create({ 
-            resource: { name: gdriveGitDir, mimeType: 'application/vnd.google-apps.folder' }, 
-            fields: 'id' 
+        const { data } = await drive.files.create({
+            resource: { name: gdriveGitDir, mimeType: 'application/vnd.google-apps.folder' },
+            fields: 'id'
         });
         rootFolderId = data.id;
     } else {
@@ -1640,11 +1640,11 @@ async function findOrCreateBaseProjectFolder(drive, workspaceRoot) {
 
     const q = `name='${escapeGdriveQueryParam(projectName)}' and mimeType='application/vnd.google-apps.folder' and '${rootFolderId}' in parents and trashed=false`;
     let { data: { files: projectFolders } } = await drive.files.list({ q: q, fields: 'files(id)' });
-    
+
     if (projectFolders.length === 0) {
-        const { data } = await drive.files.create({ 
-            resource: { name: projectName, mimeType: 'application/vnd.google-apps.folder', parents: [rootFolderId] }, 
-            fields: 'id' 
+        const { data } = await drive.files.create({
+            resource: { name: projectName, mimeType: 'application/vnd.google-apps.folder', parents: [rootFolderId] },
+            fields: 'id'
         });
         return data.id;
     } else {
@@ -1655,11 +1655,11 @@ async function findOrCreateBaseProjectFolder(drive, workspaceRoot) {
 async function findOrCreateSubFolder(drive, parentId, folderName) {
     const q = `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`;
     let { data: { files: folders } } = await drive.files.list({ q, fields: 'files(id)' });
-    
+
     if (folders.length === 0) {
-        const { data } = await drive.files.create({ 
-            resource: { name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] }, 
-            fields: 'id' 
+        const { data } = await drive.files.create({
+            resource: { name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] },
+            fields: 'id'
         });
         return data.id;
     } else {
@@ -1809,4 +1809,4 @@ async function getCurrentBranch(cwd) {
     }
 }
 
-function deactivate() {}module.exports = {    activate,    deactivate};
+function deactivate() { } module.exports = { activate, deactivate };
