@@ -1571,26 +1571,26 @@ async function getAuthenticatedClient(context) {
 
     if (oauth2Client.isTokenExpiring()) {
         try {
-            // refreshAccessToken возвращает новые токены напрямую (Credentials)
-            const newTokens = await oauth2Client.refreshAccessToken();
+            // refreshAccessToken возвращает новые токены в поле 'credentials'
+            const { credentials } = await oauth2Client.refreshAccessToken();
             const oldTokens = JSON.parse(tokensStr || '{}');
 
-            if (newTokens && newTokens.access_token) {
+            if (credentials && credentials.access_token) {
                 // Если Google не прислал refresh_token при обновлении (это стандартное поведение), сохраняем старый
-                if (oldTokens.refresh_token && !newTokens.refresh_token) {
-                    newTokens.refresh_token = oldTokens.refresh_token;
+                if (oldTokens.refresh_token && !credentials.refresh_token) {
+                    credentials.refresh_token = oldTokens.refresh_token;
                 }
-                await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(newTokens));
-                oauth2Client.setCredentials(newTokens);
+                await context.secrets.store(GOOGLE_DRIVE_TOKENS_KEY, JSON.stringify(credentials));
+                oauth2Client.setCredentials(credentials);
             } else {
                 throw new Error("Google API returned an invalid response during refresh.");
             }
         } catch (error) {
             console.error("ChangeGitToGoogleDrive: Failed to refresh token", error);
-            const detailedMessage = error.message.includes('invalid_grant')
+            const detailedMessage = error.message.includes('invalid_grant') 
                 ? "Сессия Google отозвана или недействительна (invalid_grant). Возможно, из-за смены пароля или входа с другого устройства."
                 : error.message;
-
+            
             vscode.window.showErrorMessage(
                 `Failed to refresh token: ${detailedMessage}. Please run the 'Authenticate with Google' command again. (Check 'Toggle Developer Tools' for details)`,
                 { modal: true }
