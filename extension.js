@@ -121,6 +121,28 @@ function activate(context) {
     aiWatcher.onDidCreate(debouncedAIHistorySync);
     aiWatcher.onDidDelete(debouncedAIHistorySync);
     context.subscriptions.push(aiWatcher);
+    
+    // --- МОНИТОРИНГ GIT-ХУКОВ ЧЕРЕЗ ФАЙЛ-ТРИГГЕР ---
+    if (workspaceRoot) {
+        const syncTriggerPath = path.join(workspaceRoot, '.git', 'SYNC_REQUEST');
+        const syncWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(syncTriggerPath), path.basename(syncTriggerPath)));
+        
+        const handleSyncTrigger = async () => {
+            console.log('Git hook trigger detected via SYNC_REQUEST file...');
+            try {
+                if (fsSync.existsSync(syncTriggerPath)) {
+                    await fs.unlink(syncTriggerPath);
+                }
+                await sync(context);
+            } catch (error) {
+                vscode.window.showErrorMessage(`Sync from hook trigger failed: ${error.message}`);
+            }
+        };
+
+        syncWatcher.onDidCreate(handleSyncTrigger);
+        syncWatcher.onDidChange(handleSyncTrigger);
+        context.subscriptions.push(syncWatcher);
+    }
 
     // --- МОНИТОРИНГ ВЕТОК ГИТА ---
     setupBranchMonitoring(context);
@@ -1248,7 +1270,7 @@ async function installGitHooks(context) {
     const postCommitHookPath = path.join(hooksDir, 'post-commit');
     const extensionId = 'user.changegittogoogledrive-extension';
 
-    const postCommitScript = `#!/bin/sh\n# Hook to trigger VS Code sync after commit\nif command -v code >/dev/null 2>&1; then\n  code --open-url "vscode://${extensionId}/sync"\nelse\n  echo "VS Code command 'code' not found in PATH. Cannot trigger sync."\nfi\n`;
+    const postCommitScript = `#!/bin/sh\n# Hook to trigger VS Code sync after commit\ntouch .git/SYNC_REQUEST\n`;
 
     try {
         await fs.mkdir(hooksDir, { recursive: true });
