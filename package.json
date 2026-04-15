@@ -2,7 +2,7 @@
   "name": "changegittogoogledrive-extension",
   "displayName": "ChangeGitToGoogleDrive",
   "description": "A VS Code extension to sync git commits as bundles with Google Drive",
-  "version": "1.2.8",
+  "version": "1.2.9",
   "publisher": "VitalyAdadurov",
   "repository": {
     "type": "git",
@@ -123,10 +123,27 @@
           "type": "boolean",
           "default": false,
           "description": "Автоматически синхронизировать историю AI при запуске VS Code."
+        },
+        "changegittogoogledrive-extension.clipboard.syncEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Включить общую облачную корзину (Cloud Clipboard) через Google Drive."
+        },
+        "changegittogoogledrive-extension.clipboard.syncInterval": {
+          "type": "integer",
+          "default": 5000,
+          "description": "Интервал проверки буфера обмена в миллисекундах (минимум 1000)."
         }
       }
     }
   },
+  "contributes": {
+    "commands": [
+      {
+        "command": "changegittogoogledrive-extension.toggleClipboardSync",
+        "title": "Cloud Clipboard: Вкл/Выкл синхронизацию",
+        "category": "Git-To-Google-Drive"
+      },
   "devDependencies": {
     "@types/vscode": "^1.85.0",
     "@types/node": "18.x",

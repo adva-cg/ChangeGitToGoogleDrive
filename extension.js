@@ -862,7 +862,14 @@ async function pushCommits(context) {
 
     const currentBranch = await getCurrentBranch(workspaceRoot);
     const lastPushedHash = context.workspaceState.get(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`);
-    const currentHead = (await runCommand('git rev-parse HEAD', workspaceRoot)).stdout.trim();
+    let currentHead;
+    try {
+        const headRes = await runCommand('git rev-parse HEAD', workspaceRoot);
+        currentHead = headRes.stdout.trim();
+    } catch (e) {
+        vscode.window.showWarningMessage('Репозиторий пуст. Для синхронизации истории необходимо сделать хотя бы один коммит.', { modal: true });
+        return;
+    }
 
     if (lastPushedHash === currentHead) {
         vscode.window.showInformationMessage('Already up-to-date. Nothing to push.');
@@ -1801,11 +1808,19 @@ function runCommand(command, cwd) {
 
 async function getCurrentBranch(cwd) {
     try {
-        const { stdout } = await runCommand('git rev-parse --abbrev-ref HEAD', cwd);
-        return stdout.trim();
+        // Пытаемся получить текущую ветку методом, который работает даже в пустых репозиториях (Git 2.22+)
+        const { stdout } = await runCommand('git branch --show-current', cwd);
+        const branch = stdout.trim();
+        if (branch) {
+            return branch;
+        }
+
+        // Если команда не вернула имя (старый Git?), пробуем запасной вариант
+        const { stdout: fallback } = await runCommand('git rev-parse --abbrev-ref HEAD', cwd);
+        return fallback.trim();
     } catch (error) {
-        vscode.window.showErrorMessage('Could not determine the current git branch.');
-        throw error;
+        console.error('Error in getCurrentBranch:', error);
+        throw new Error('Не удалось определить текущую ветку. Если репозиторий новый, сделайте первый коммит.');
     }
 }
 
