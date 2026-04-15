@@ -20,6 +20,8 @@ const PROCESSED_TOMBSTONES_KEY = 'processedBranchTombstones';
 const AI_HISTORY_ENABLED_KEY = 'aiHistoryEnabled'; // Stores true/false/undefined for the current project
 const AI_HISTORY_IDS_KEY = 'aiHistoryConversationIds'; // Array of IDs for the current project
 const AI_HISTORY_LOCAL_PATH = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+const CLIPBOARD_SYNC_FILE_NAME = 'clipboard_sync.json';
+const LAST_CLIPBOARD_HASH_KEY = 'lastClipboardHash';
 
 function escapeGdriveQueryParam(param) {
     if (!param) return "";
@@ -45,7 +47,8 @@ function activate(context) {
         vscode.commands.registerCommand('changegittogoogledrive-extension.deleteUntrackedFile', () => deleteUntrackedFile(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.clearTombstones', () => clearTombstones(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.syncAIHistory', () => syncAIHistory(context, false)),
-        vscode.commands.registerCommand('changegittogoogledrive-extension.configureAIHistorySync', () => configureAIHistorySync(context))
+        vscode.commands.registerCommand('changegittogoogledrive-extension.configureAIHistorySync', () => configureAIHistorySync(context)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.toggleClipboardSync', () => toggleClipboardSync(context))
     );
 
     // --- РЕГИСТРАЦИЯ ОБРАБОТЧИКА URI ДЛЯ GIT HOOKS ---
@@ -121,6 +124,190 @@ function activate(context) {
 
     // --- МОНИТОРИНГ ВЕТОК ГИТА ---
     setupBranchMonitoring(context);
+
+    // --- ОБЛАЧНЫЙ БУФЕР ОБМЕНА ---
+    setupCloudClipboard(context);
+}
+
+let clipboardInterval;
+
+async function toggleClipboardSync(context) {
+    const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.clipboard');
+    const currentState = config.get('syncEnabled');
+    await config.update('syncEnabled', !currentState, vscode.ConfigurationTarget.Global);
+    
+    if (!currentState) {
+        vscode.window.showInformationMessage('Cloud Clipboard: Синхронизация включена');
+        setupCloudClipboard(context);
+    } else {
+        vscode.window.showInformationMessage('Cloud Clipboard: Синхронизация выключена');
+        if (clipboardInterval) {
+            clearInterval(clipboardInterval);
+            clipboardInterval = null;
+        }
+    }
+}
+
+async function setupCloudClipboard(context) {
+    if (clipboardInterval) {
+        clearInterval(clipboardInterval);
+    }
+
+    const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.clipboard');
+    if (!config.get('syncEnabled')) return;
+
+    const intervalTime = Math.max(config.get('syncInterval') || 5000, 1000);
+    
+    // Пытаемся синхронизироваться сразу при запуске
+    syncCloudClipboard(context).catch(e => console.error('Initial clipboard sync failed:', e));
+
+    clipboardInterval = setInterval(() => {
+        syncCloudClipboard(context).catch(e => console.error('Periodic clipboard sync failed:', e));
+    }, intervalTime);
+    
+    context.subscriptions.push({ dispose: () => clearInterval(clipboardInterval) });
+}
+
+let isSyncingClipboard = false;
+async function syncCloudClipboard(context) {
+    if (isSyncingClipboard) return;
+    isSyncingClipboard = true;
+
+    try {
+        const drive = await getAuthenticatedClient(context);
+        if (!drive) {
+            isSyncingClipboard = false;
+            return;
+        }
+
+        const machineId = vscode.env.machineId;
+        const gdriveGitDirId = await findOrCreateBaseGdriveDir(drive);
+        if (!gdriveGitDirId) throw new Error("Could not find/create base GDrive folder");
+
+        const syncFile = await findClipboardSyncFile(drive, gdriveGitDirId);
+        
+        // 1. Проверяем локальный буфер
+        const local = await getLocalClipboard();
+        const lastLocalHash = context.globalState.get(LAST_CLIPBOARD_HASH_KEY);
+
+        if (local && local.hash !== lastLocalHash) {
+            // Буфер изменился локально - выгружаем
+            console.log('Clipboard changed locally, uploading...');
+            const content = {
+                type: local.type,
+                data: local.data,
+                timestamp: new Date().toISOString(),
+                machineId: machineId
+            };
+
+            if (syncFile) {
+                await drive.files.update({
+                    fileId: syncFile.id,
+                    resource: { appProperties: { machineId: machineId, hash: local.hash } },
+                    media: { mimeType: 'application/json', body: JSON.stringify(content) }
+                });
+            } else {
+                await drive.files.create({
+                    resource: { 
+                        name: CLIPBOARD_SYNC_FILE_NAME, 
+                        parents: [gdriveGitDirId], 
+                        appProperties: { machineId: machineId, hash: local.hash } 
+                    },
+                    media: { mimeType: 'application/json', body: JSON.stringify(content) }
+                });
+            }
+            await context.globalState.update(LAST_CLIPBOARD_HASH_KEY, local.hash);
+        }
+
+        // 2. Проверяем облако
+        if (syncFile) {
+            const remoteMachineId = syncFile.appProperties ? syncFile.appProperties.machineId : null;
+            const remoteHash = syncFile.appProperties ? syncFile.appProperties.hash : null;
+
+            if (remoteMachineId && remoteMachineId !== machineId && remoteHash !== lastLocalHash) {
+                // В облаке данные от другого устройства и у нас их еще нет
+                console.log('Cloud clipboard has new data from another device, downloading...');
+                const { data: content } = await drive.files.get({ fileId: syncFile.id, alt: 'media' });
+                
+                if (content && content.type && content.data) {
+                    await setLocalClipboard(content.type, content.data);
+                    await context.globalState.update(LAST_CLIPBOARD_HASH_KEY, remoteHash);
+                    vscode.window.showStatusBarMessage(`📋 Буфер обновлен из облака (${content.type === 'image' ? 'Картинка' : 'Текст'})`, 3000);
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Clipboard sync error:', error);
+    } finally {
+        isSyncingClipboard = false;
+    }
+}
+
+async function findClipboardSyncFile(drive, parentId) {
+    const q = `name='${CLIPBOARD_SYNC_FILE_NAME}' and '${parentId}' in parents and trashed=false`;
+    const { data: { files } } = await drive.files.list({ q, fields: 'files(id, name, appProperties, modifiedTime)' });
+    return files.length > 0 ? files[0] : null;
+}
+
+async function findOrCreateBaseGdriveDir(drive) {
+    const gdriveGitDir = `.gdrive-git`;
+    let { data: { files: rootFolders } } = await drive.files.list({
+        q: `name='${gdriveGitDir}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+        fields: 'files(id)'
+    });
+
+    if (rootFolders.length === 0) {
+        const { data } = await drive.files.create({
+            resource: { name: gdriveGitDir, mimeType: 'application/vnd.google-apps.folder' },
+            fields: 'id'
+        });
+        return data.id;
+    }
+    return rootFolders[0].id;
+}
+
+async function getLocalClipboard() {
+    // 1. Проверяем на картинку через PowerShell
+    try {
+        const isImage = (await runCommand('powershell -noprofile -command "Add-Type -AssemblyName System.Windows.Forms; [Windows.Forms.Clipboard]::ContainsImage()"')).stdout.trim() === 'True';
+        if (isImage) {
+            const base64 = (await runCommand('powershell -noprofile -command "Add-Type -AssemblyName System.Windows.Forms; $img = [Windows.Forms.Clipboard]::GetImage(); if ($img) { $ms = New-Object System.IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [Convert]::ToBase64String($ms.ToArray()) }"')).stdout.trim();
+            if (base64) {
+                const hash = crypto.createHash('md5').update(base64).digest('hex');
+                return { type: 'image', data: base64, hash: hash };
+            }
+        }
+    } catch (e) {
+        console.error('Failed to check for image in clipboard:', e);
+    }
+
+    // 2. Если не картинка, проверяем текст
+    const text = await vscode.env.clipboard.readText();
+    if (text) {
+        const hash = crypto.createHash('md5').update(text).digest('hex');
+        return { type: 'text', data: text, hash: hash };
+    }
+
+    return null;
+}
+
+async function setLocalClipboard(type, data) {
+    if (type === 'text') {
+        await vscode.env.clipboard.writeText(data);
+    } else if (type === 'image') {
+        try {
+            // Используем временный файл для записи картинки, чтобы не превысить лимит длины команды PowerShell
+            const tempFile = path.join(os.tmpdir(), `cv_temp_${Date.now()}.b64`);
+            await fs.writeFile(tempFile, data);
+            
+            const psCommand = `powershell -noprofile -command "Add-Type -AssemblyName System.Windows.Forms; $b64 = Get-Content '${tempFile}' -Raw; [Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromStream((New-Object System.IO.MemoryStream([Convert]::FromBase64String($b64)))))"`;
+            await runCommand(psCommand);
+            
+            await fs.unlink(tempFile);
+        } catch (e) {
+            console.error('Failed to set image to clipboard:', e);
+        }
+    }
 }
 
 let lastKnownBranches = new Set();
