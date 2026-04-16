@@ -23,6 +23,7 @@ const AI_HISTORY_LOCAL_PATH = path.join(os.homedir(), '.gemini', 'antigravity', 
 const CLIPBOARD_SYNC_FILE_NAME = 'clipboard_sync.json';
 const LAST_CLIPBOARD_HASH_KEY = 'lastClipboardHash';
 const REFS_FILE_NAME = 'refs.json';
+const CONFLICT_DECISIONS_KEY = 'untrackedConflictDecisions';
 
 function escapeGdriveQueryParam(param) {
     if (!param) return "";
