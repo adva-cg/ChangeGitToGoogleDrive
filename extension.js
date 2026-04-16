@@ -108,12 +108,13 @@ function activate(context) {
 
     const debouncedAIHistorySync = () => {
         clearTimeout(aiHistorySyncTimeout);
-        aiHistorySyncTimeout = setTimeout(() => {
+        aiHistorySyncTimeout = setTimeout(async () => {
             const aiHistoryConfig = vscode.workspace.getConfiguration('changegittogoogledrive-extension.aiHistory');
             const isEnabled = context.workspaceState.get(AI_HISTORY_ENABLED_KEY);
             // Синхронизируем, если включено и не в режиме 'never'
             if (isEnabled !== false && aiHistoryConfig.get('syncMode') !== 'never') {
                 console.log('Auto-syncing AI history after changes...');
+                await trackCurrentConversation(context); // Обновляем текущую беседу перед синхронизацией
                 syncAIHistory(context, true);
             }
         }, 60000); // 60 секунд тишины перед синхронизацией
@@ -1740,32 +1741,40 @@ async function syncAIHistory(context, silent = false) {
 }
 
 async function syncFolder(drive, localPath, remoteFolderId, machineId, silent) {
-    const localFiles = await fs.readdir(localPath);
-    const remoteFiles = await getAllRemoteFiles(drive, remoteFolderId);
+    try {
+        const localEntries = await fs.readdir(localPath);
+        const remoteFiles = await getAllRemoteFiles(drive, remoteFolderId);
 
-    for (const file of localFiles) {
-        const localFilePath = path.join(localPath, file);
-        const stats = await fs.stat(localFilePath);
-        if (stats.isDirectory()) continue;
+        for (const entry of localEntries) {
+            const localEntryPath = path.join(localPath, entry);
+            const stats = await fs.stat(localEntryPath);
 
-        const localMd5 = await getFileMd5(localFilePath);
-        const remoteFile = remoteFiles.find(f => f.name === file);
+            if (stats.isDirectory()) {
+                const remoteSubFolderId = await findOrCreateSubFolder(drive, remoteFolderId, entry);
+                await syncFolder(drive, localEntryPath, remoteSubFolderId, machineId, silent);
+            } else {
+                const localMd5 = await getFileMd5(localEntryPath);
+                const remoteFile = remoteFiles.find(f => f.name === entry);
 
-        if (remoteFile) {
-            if (localMd5 !== remoteFile.md5Checksum) {
-                const remoteMachineId = (remoteFile.appProperties && remoteFile.appProperties.machineId) ? remoteFile.appProperties.machineId : null;
-                if (remoteMachineId !== machineId) {
-                    await updateFile(drive, remoteFile.id, localFilePath, machineId);
+                if (remoteFile) {
+                    if (localMd5 !== remoteFile.md5Checksum) {
+                        const remoteMachineId = (remoteFile.appProperties && remoteFile.appProperties.machineId) ? remoteFile.appProperties.machineId : null;
+                        if (remoteMachineId !== machineId) {
+                            await updateFile(drive, remoteFile.id, localEntryPath, machineId);
+                        }
+                    }
+                } else {
+                    await createFile(drive, remoteFolderId, localEntryPath, entry, machineId);
                 }
             }
-        } else {
-            await createFile(drive, remoteFolderId, localFilePath, file, machineId);
         }
+    } catch (e) {
+        console.error(`Error syncing folder ${localPath}:`, e);
     }
 }
 
 async function downloadFolder(drive, remoteFolderId, localPath, silent) {
-    const remoteFiles = await getAllRemoteFiles(drive, remoteFolderId);
+    const remoteFiles = await getAllRemoteFiles(drive, remoteFolderId, true);
     for (const file of remoteFiles) {
         const destPath = path.join(localPath, file.name);
         await downloadFile(drive, file.id, destPath);
@@ -1992,16 +2001,25 @@ async function uploadBundleFile(drive, filePath, parentFolderId) {
     });
 }
 
-async function getAllRemoteFiles(drive, folderId) {
+async function getAllRemoteFiles(drive, folderId, recursive = false, prefix = '') {
     let files = [];
     let pageToken = null;
     do {
         const res = await drive.files.list({
             q: `'${folderId}' in parents and trashed=false and name != '.deleted'`,
-            fields: 'nextPageToken, files(id, name, md5Checksum, appProperties)',
+            fields: 'nextPageToken, files(id, name, md5Checksum, appProperties, mimeType)',
             pageToken: pageToken,
         });
-        files = files.concat(res.data.files);
+        
+        for (const file of res.data.files) {
+            const fullName = prefix ? `${prefix}/${file.name}` : file.name;
+            if (recursive && file.mimeType === 'application/vnd.google-apps.folder') {
+                const subFiles = await getAllRemoteFiles(drive, file.id, true, fullName);
+                files = files.concat(subFiles);
+            } else {
+                files.push({ ...file, name: fullName });
+            }
+        }
         pageToken = res.data.nextPageToken;
     } while (pageToken);
     return files;
