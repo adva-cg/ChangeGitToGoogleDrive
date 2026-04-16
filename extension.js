@@ -22,6 +22,7 @@ const AI_HISTORY_IDS_KEY = 'aiHistoryConversationIds'; // Array of IDs for the c
 const AI_HISTORY_LOCAL_PATH = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
 const CLIPBOARD_SYNC_FILE_NAME = 'clipboard_sync.json';
 const LAST_CLIPBOARD_HASH_KEY = 'lastClipboardHash';
+const REFS_FILE_NAME = 'refs.json';
 
 function escapeGdriveQueryParam(param) {
     if (!param) return "";
@@ -989,12 +990,66 @@ async function initialUpload(context) {
     }
 }
 
+
+async function getRemoteRefs(drive, bundleFolderId) {
+    const q = `name='${REFS_FILE_NAME}' and '${bundleFolderId}' in parents and trashed=false`;
+    const { data: { files } } = await drive.files.list({ q, fields: 'files(id, name)' });
+    
+    if (files.length === 0) return {};
+
+    try {
+        const response = await drive.files.get({ fileId: files[0].id, alt: 'media' });
+        return response.data;
+    } catch (error) {
+        console.error('Error reading remote refs:', error);
+        return {};
+    }
+}
+
+async function updateRemoteRefs(drive, bundleFolderId, refs) {
+    const q = `name='${REFS_FILE_NAME}' and '${bundleFolderId}' in parents and trashed=false`;
+    const { data: { files } } = await drive.files.list({ q, fields: 'files(id, name)' });
+
+    const content = JSON.stringify(refs, null, 2);
+    const media = {
+        mimeType: 'application/json',
+        body: content,
+    };
+
+    if (files.length > 0) {
+        await drive.files.update({
+            fileId: files[0].id,
+            media: media,
+        });
+    } else {
+        await drive.files.create({
+            requestBody: {
+                name: REFS_FILE_NAME,
+                parents: [bundleFolderId],
+            },
+            media: media,
+        });
+    }
+}
+
 async function sync(context, silent = false) {
     if (!silent) vscode.window.showInformationMessage('Syncing with Google Drive...');
     try {
-        await checkRemoteBranchTombstones(context, silent);
-        await pullCommits(context, silent);
-        await pushCommits(context, silent);
+        const drive = await getAuthenticatedClient(context);
+        const workspaceRoot = getWorkspaceRoot();
+        if (!workspaceRoot) return;
+
+        const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
+        if (!bundleFolderId) {
+            throw new Error('Could not find or create project folder on Google Drive.');
+        }
+
+        const remoteRefs = await getRemoteRefs(drive, bundleFolderId);
+
+        await checkRemoteBranchTombstones(context, drive, bundleFolderId, silent);
+        await pullCommits(context, drive, bundleFolderId, remoteRefs, silent);
+        await pushCommits(context, drive, bundleFolderId, remoteRefs, silent);
+
         if (!silent) vscode.window.showInformationMessage('Sync finished.');
     } catch (error) {
         if (silent) {
@@ -1006,12 +1061,9 @@ async function sync(context, silent = false) {
     }
 }
 
-async function checkRemoteBranchTombstones(context, silent = false) {
+async function checkRemoteBranchTombstones(context, drive, bundleFolderId, silent = false) {
     const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) return;
-
-    const drive = await getAuthenticatedClient(context);
-    if (!drive) return;
 
     try {
         const tombstonesFolderId = await findOrCreateTombstonesFolder(drive, workspaceRoot);
@@ -1067,15 +1119,14 @@ async function checkRemoteBranchTombstones(context, silent = false) {
     }
 }
 
-async function pushCommits(context, silent = false) {
+async function pushCommits(context, drive, bundleFolderId, remoteRefs, silent = false) {
     const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) return;
 
-    const drive = await getAuthenticatedClient(context);
-    if (!drive) return;
-
     const currentBranch = await getCurrentBranch(workspaceRoot);
-    const lastPushedHash = context.workspaceState.get(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`);
+    const remoteBranchHead = remoteRefs[currentBranch];
+    const lastPushedHash = remoteBranchHead || context.workspaceState.get(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`);
+
     let currentHead;
     try {
         const headRes = await runCommand('git rev-parse HEAD', workspaceRoot);
@@ -1103,9 +1154,6 @@ async function pushCommits(context, silent = false) {
         }
     }
 
-    const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
-    if (!bundleFolderId) return;
-
     const revisionRange = lastPushedHash ? `${lastPushedHash}..HEAD` : 'HEAD';
     const { stdout: commitsToPush } = await runCommand(`git rev-list ${revisionRange}`, workspaceRoot);
 
@@ -1125,6 +1173,10 @@ async function pushCommits(context, silent = false) {
 
         await uploadBundleFile(drive, bundlePath, bundleFolderId);
 
+        // Update remote refs locally and then on drive
+        remoteRefs[currentBranch] = currentHead;
+        await updateRemoteRefs(drive, bundleFolderId, remoteRefs);
+
         await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`, currentHead);
         if (!silent) vscode.window.showInformationMessage(`Successfully pushed commits up to ${currentHead.substring(0, 7)}.`);
 
@@ -1137,15 +1189,9 @@ async function pushCommits(context, silent = false) {
     }
 }
 
-async function pullCommits(context, silent = false) {
+async function pullCommits(context, drive, bundleFolderId, remoteRefs, silent = false) {
     const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) return;
-
-    const drive = await getAuthenticatedClient(context);
-    if (!drive) return;
-
-    const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
-    if (!bundleFolderId) return;
 
     if (!silent) vscode.window.showInformationMessage('Checking for remote changes...');
 
@@ -1158,7 +1204,7 @@ async function pullCommits(context, silent = false) {
     });
 
     if (!allRemoteBundles || allRemoteBundles.length === 0) {
-        vscode.window.showInformationMessage('No remote bundles found.');
+        if (!silent) vscode.window.showInformationMessage('No remote bundles found.');
         return;
     }
 
@@ -1206,18 +1252,44 @@ async function pullCommits(context, silent = false) {
                 }
                 newCommitsFound = true;
 
-                vscode.window.showInformationMessage(`Found ${newBundles.length} new commit(s) for current branch '${branchName}'. Fetching...`);
+                if (!silent) vscode.window.showInformationMessage(`Found ${newBundles.length} new commit(s) for current branch '${branchName}'. Fetching...`);
+                let lastFetchedHash = '';
                 for (const bundle of newBundles) {
                     const tempBundlePath = path.join(tempDir, bundle.name);
                     await downloadFile(drive, bundle.id, tempBundlePath);
                     await runCommand(`git fetch "${tempBundlePath}"`, workspaceRoot);
+                    lastFetchedHash = bundle.name.split('--')[1]?.replace('.bundle', '');
                 }
                 changesMade = true;
+
                 try {
+                    // Try fast-forward first
                     await runCommand(`git merge --ff-only FETCH_HEAD`, workspaceRoot);
-                    vscode.window.showInformationMessage(`Successfully merged remote changes into '${branchName}'.`);
-                } catch (error) {
-                    vscode.window.showInformationMessage(`New commits for '${branchName}' have been fetched. Please merge or rebase manually.`);
+                    if (!silent) vscode.window.showInformationMessage(`Successfully fast-forwarded '${branchName}' to latest remote changes.`);
+                } catch (ffError) {
+                    // If FF fails, try regular merge
+                    try {
+                        await runCommand(`git merge --no-edit FETCH_HEAD`, workspaceRoot);
+                        vscode.window.showInformationMessage(`History for '${branchName}' has been merged automatically. Please review changes before proceeding.`, 'OK');
+                    } catch (mergeError) {
+                        // If merge fails (conflicts), abort in silent mode to keep workspace clean.
+                        // In manual mode, leave it in merging state so the user can resolve it immediately.
+                        if (silent) {
+                            await runCommand(`git merge --abort`, workspaceRoot).catch(() => {});
+                        }
+
+                        vscode.window.showErrorMessage(
+                            `Merge conflict encountered for '${branchName}'. ${silent ? 'Automatic sync aborted.' : 'Please resolve conflicts in the editor.'}`,
+                            { modal: true }
+                        );
+                        throw mergeError;
+                    }
+                }
+
+                // Update local knowledge of what is pushed
+                const remoteHead = remoteRefs[branchName] || lastFetchedHash;
+                if (remoteHead) {
+                    await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${branchName}`, remoteHead);
                 }
 
             } else {
@@ -1230,7 +1302,7 @@ async function pullCommits(context, silent = false) {
                 );
 
                 if (choice === 'Yes') {
-                    vscode.window.showInformationMessage(`Fetching bundles for new branch '${branchName}'...`);
+                    if (!silent) vscode.window.showInformationMessage(`Fetching bundles for new branch '${branchName}'...`);
                     let lastHash = '';
                     for (const bundle of bundles) { // Already sorted by createdTime
                         const tempBundlePath = path.join(tempDir, bundle.name);
