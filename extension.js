@@ -1533,6 +1533,24 @@ async function manageSyncHash(context) {
 
     await context.workspaceState.update(hashKey, newHash);
 
+    // --- Sync with Drive ---
+    try {
+        const drive = await getAuthenticatedClient(context);
+        const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
+        if (bundleFolderId) {
+            const remoteRefs = await getRemoteRefs(drive, bundleFolderId);
+            if (newHash === undefined) {
+                delete remoteRefs[currentBranch];
+            } else {
+                remoteRefs[currentBranch] = newHash;
+            }
+            await updateRemoteRefs(drive, bundleFolderId, remoteRefs);
+        }
+    } catch (e) {
+        console.error('Failed to sync hash update to Drive:', e);
+        vscode.window.showWarningMessage('Локальный хеш обновлен, но не удалось синхронизировать его с Google Drive.');
+    }
+
     if (newHash === undefined) {
         vscode.window.showInformationMessage(`Хеш синхронизации для ветки '${currentBranch}' был сброшен.`);
     } else {
