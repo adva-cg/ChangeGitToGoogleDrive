@@ -133,7 +133,7 @@ function activate(context) {
                 if (fsSync.existsSync(syncTriggerPath)) {
                     await fs.unlink(syncTriggerPath);
                 }
-                await sync(context);
+                await sync(context, true);
             } catch (error) {
                 vscode.window.showErrorMessage(`Sync from hook trigger failed: ${error.message}`);
             }
@@ -989,19 +989,24 @@ async function initialUpload(context) {
     }
 }
 
-async function sync(context) {
-    vscode.window.showInformationMessage('Syncing with Google Drive...');
+async function sync(context, silent = false) {
+    if (!silent) vscode.window.showInformationMessage('Syncing with Google Drive...');
     try {
-        await checkRemoteBranchTombstones(context);
-        await pullCommits(context);
-        await pushCommits(context);
-        vscode.window.showInformationMessage('Sync finished.');
+        await checkRemoteBranchTombstones(context, silent);
+        await pullCommits(context, silent);
+        await pushCommits(context, silent);
+        if (!silent) vscode.window.showInformationMessage('Sync finished.');
     } catch (error) {
-        vscode.window.showErrorMessage(`Sync failed: ${error.message}`, { modal: true });
+        if (silent) {
+            console.error(`Sync failed: ${error.message}`);
+            vscode.window.showErrorMessage(`Background sync failed: ${error.message}. Check output logs for details.`);
+        } else {
+            vscode.window.showErrorMessage(`Sync failed: ${error.message}`, { modal: true });
+        }
     }
 }
 
-async function checkRemoteBranchTombstones(context) {
+async function checkRemoteBranchTombstones(context, silent = false) {
     const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) return;
 
@@ -1035,7 +1040,7 @@ async function checkRemoteBranchTombstones(context) {
                 if (choice === 'Да') {
                     try {
                         await runCommand(`git branch -D ${branchName}`, workspaceRoot);
-                        vscode.window.showInformationMessage(`Ветка '${branchName}' удалена локально.`);
+                        if (!silent) vscode.window.showInformationMessage(`Ветка '${branchName}' удалена локально.`);
 
                         // Если удалили текущую ветку, переключаемся на main/master
                         const current = await getCurrentBranch(workspaceRoot);
@@ -1043,7 +1048,7 @@ async function checkRemoteBranchTombstones(context) {
                             const defaultBranch = localBranches.includes('main') ? 'main' : (localBranches.includes('master') ? 'master' : null);
                             if (defaultBranch) {
                                 await runCommand(`git checkout ${defaultBranch}`, workspaceRoot);
-                                vscode.window.showInformationMessage(`Переключено на '${defaultBranch}'.`);
+                                if (!silent) vscode.window.showInformationMessage(`Переключено на '${defaultBranch}'.`);
                             }
                         }
                     } catch (e) {
@@ -1062,7 +1067,7 @@ async function checkRemoteBranchTombstones(context) {
     }
 }
 
-async function pushCommits(context) {
+async function pushCommits(context, silent = false) {
     const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) return;
 
@@ -1081,7 +1086,7 @@ async function pushCommits(context) {
     }
 
     if (lastPushedHash === currentHead) {
-        vscode.window.showInformationMessage('Already up-to-date. Nothing to push.');
+        if (!silent) vscode.window.showInformationMessage('Already up-to-date. Nothing to push.');
         return;
     }
 
@@ -1105,7 +1110,7 @@ async function pushCommits(context) {
     const { stdout: commitsToPush } = await runCommand(`git rev-list ${revisionRange}`, workspaceRoot);
 
     if (!commitsToPush.trim()) {
-        vscode.window.showInformationMessage('No new commits to push.');
+        if (!silent) vscode.window.showInformationMessage('No new commits to push.');
         return;
     }
 
@@ -1114,14 +1119,14 @@ async function pushCommits(context) {
     const bundlePath = path.join(workspaceRoot, '.git', bundleFileName);
 
     try {
-        vscode.window.showInformationMessage(`Creating bundle for range: ${revisionRange}`);
+        if (!silent) vscode.window.showInformationMessage(`Creating bundle for range: ${revisionRange}`);
         const bundleCommand = `git bundle create \"${bundlePath}\" ${revisionRange}`;
         await runCommand(bundleCommand, workspaceRoot);
 
         await uploadBundleFile(drive, bundlePath, bundleFolderId);
 
         await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`, currentHead);
-        vscode.window.showInformationMessage(`Successfully pushed commits up to ${currentHead.substring(0, 7)}.`);
+        if (!silent) vscode.window.showInformationMessage(`Successfully pushed commits up to ${currentHead.substring(0, 7)}.`);
 
     } catch (error) {
         vscode.window.showErrorMessage(`Push failed: ${error.message}`);
@@ -1132,7 +1137,7 @@ async function pushCommits(context) {
     }
 }
 
-async function pullCommits(context) {
+async function pullCommits(context, silent = false) {
     const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) return;
 
@@ -1142,7 +1147,7 @@ async function pullCommits(context) {
     const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
     if (!bundleFolderId) return;
 
-    vscode.window.showInformationMessage('Checking for remote changes...');
+    if (!silent) vscode.window.showInformationMessage('Checking for remote changes...');
 
     // 1. Get all remote bundles
     const q = `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle'`;
