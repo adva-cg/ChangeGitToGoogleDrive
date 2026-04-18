@@ -20,6 +20,8 @@ const PROCESSED_TOMBSTONES_KEY = 'processedBranchTombstones';
 const AI_HISTORY_ENABLED_KEY = 'aiHistoryEnabled'; // Stores true/false/undefined for the current project
 const AI_HISTORY_IDS_KEY = 'aiHistoryConversationIds'; // Array of IDs for the current project
 const AI_HISTORY_LOCAL_PATH = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+const AI_HISTORY_CONVERSATIONS_PATH = path.join(os.homedir(), '.gemini', 'antigravity', 'conversations');
+const AI_KNOWLEDGE_LOCAL_PATH = path.join(os.homedir(), '.gemini', 'antigravity', 'knowledge');
 const CLIPBOARD_SYNC_FILE_NAME = 'clipboard_sync.json';
 const LAST_CLIPBOARD_HASH_KEY = 'lastClipboardHash';
 const REFS_FILE_NAME = 'refs.json';
@@ -1711,22 +1713,42 @@ async function syncAIHistory(context, silent = false) {
 
         const machineId = vscode.env.machineId;
 
+        // 1. Синхронизируем основную папку (brain)
         for (const convId of allRelevantIds) {
             const localPath = path.join(AI_HISTORY_LOCAL_PATH, convId);
+            const localPbPath = path.join(AI_HISTORY_CONVERSATIONS_PATH, `${convId}.pb`);
             const remoteConvFolderId = await findOrCreateSubFolder(drive, historyFolderId, convId);
 
             if (fsSync.existsSync(localPath)) {
-                // Синхронизируем файлы внутри папки чата
                 await syncFolder(drive, localPath, remoteConvFolderId, machineId, silent);
             } else {
-                // Если чата нет локально - скачиваем его
                 if (!silent) vscode.window.showInformationMessage(`Загрузка нового чата: ${convId}`);
                 await downloadFolder(drive, remoteConvFolderId, localPath, silent);
             }
+
+            // 2. Синхронизируем .pb файл (conversations)
+            const remoteFiles = await getAllRemoteFiles(drive, remoteConvFolderId);
+            const pbFileNameOnDrive = `${convId}.pb`;
+            const remotePbFile = remoteFiles.find(f => f.name === pbFileNameOnDrive);
+
+            if (fsSync.existsSync(localPbPath)) {
+                if (remotePbFile) {
+                    await syncFileWithConflictResolution(drive, localPbPath, remotePbFile, machineId, silent);
+                } else {
+                    await createFile(drive, remoteConvFolderId, localPbPath, pbFileNameOnDrive, machineId);
+                }
+            } else if (remotePbFile) {
+                await downloadFile(drive, remotePbFile.id, localPbPath);
+            }
         }
 
-        // 2. Обновляем манифест на диске, если добавились новые ID
+        // 2. Синхронизируем Базу Знаний (Knowledge Items) целиком
+        const knowledgeFolderId = await findOrCreateAIKnowledgeFolder(drive, workspaceRoot);
+        await syncFolder(drive, AI_KNOWLEDGE_LOCAL_PATH, knowledgeFolderId, machineId, silent);
+
+        // 3. Обновляем манифест на диске и локально
         const mergedIds = Array.from(allRelevantIds);
+        await context.workspaceState.update(AI_HISTORY_IDS_KEY, mergedIds);
         if (mergedIds.length > (remoteManifest.ids || []).length) {
             await drive.files.update({
                 fileId: manifestFileId,
@@ -1746,6 +1768,8 @@ async function syncFolder(drive, localPath, remoteFolderId, machineId, silent) {
         const remoteFiles = await getAllRemoteFiles(drive, remoteFolderId);
 
         for (const entry of localEntries) {
+            if (entry === 'knowledge.lock') continue; // Пропускаем файл блокировки
+
             const localEntryPath = path.join(localPath, entry);
             const stats = await fs.stat(localEntryPath);
 
@@ -1753,16 +1777,9 @@ async function syncFolder(drive, localPath, remoteFolderId, machineId, silent) {
                 const remoteSubFolderId = await findOrCreateSubFolder(drive, remoteFolderId, entry);
                 await syncFolder(drive, localEntryPath, remoteSubFolderId, machineId, silent);
             } else {
-                const localMd5 = await getFileMd5(localEntryPath);
                 const remoteFile = remoteFiles.find(f => f.name === entry);
-
                 if (remoteFile) {
-                    if (localMd5 !== remoteFile.md5Checksum) {
-                        const remoteMachineId = (remoteFile.appProperties && remoteFile.appProperties.machineId) ? remoteFile.appProperties.machineId : null;
-                        if (remoteMachineId !== machineId) {
-                            await updateFile(drive, remoteFile.id, localEntryPath, machineId);
-                        }
-                    }
+                    await syncFileWithConflictResolution(drive, localEntryPath, remoteFile, machineId, silent);
                 } else {
                     await createFile(drive, remoteFolderId, localEntryPath, entry, machineId);
                 }
@@ -1770,6 +1787,59 @@ async function syncFolder(drive, localPath, remoteFolderId, machineId, silent) {
         }
     } catch (e) {
         console.error(`Error syncing folder ${localPath}:`, e);
+    }
+}
+
+async function syncFileWithConflictResolution(drive, localPath, remoteFile, machineId, silent) {
+    const localMd5 = await getFileMd5(localPath);
+    if (localMd5 === remoteFile.md5Checksum) return;
+
+    const stats = await fs.stat(localPath);
+    const localTime = stats.mtime.getTime();
+    const remoteTime = new Date(remoteFile.modifiedTime).getTime();
+    const fileName = path.basename(localPath);
+
+    // Добавляем буфер 2 сек для учета разницы в точности файловых систем
+    if (remoteTime > localTime + 2000) {
+        // Удаленная версия новее - скачиваем
+        await downloadFile(drive, remoteFile.id, localPath);
+    } else if (localTime > remoteTime + 2000) {
+        // Локальная версия новее - выгружаем
+        await updateFile(drive, remoteFile.id, localPath, machineId);
+    } else {
+        // Конфликт (время почти совпадает или MD5 разный при равном времени)
+        if (silent) {
+            // В тихом режиме отдаем приоритет облаку во избежание потери данных с другого ПК
+            await downloadFile(drive, remoteFile.id, localPath);
+        } else {
+            const options = [
+                { label: "Загрузить из Google Drive (Перезаписать мою)", action: "download" },
+                { label: "Оставить мою версию (Перезаписать в облаке)", action: "upload" },
+                { label: "Сравнить изменения", action: "compare" }
+            ];
+            const choice = await vscode.window.showQuickPick(options, { 
+                placeHolder: `Конфликт в файле AI: ${fileName}. Время почти совпадает. Что сделать?`,
+                ignoreFocusOut: true 
+            });
+
+            if (choice && choice.action === 'compare') {
+                const tempRemotePath = path.join(os.tmpdir(), `gdrive-remote-${Date.now()}-${path.basename(localPath)}`);
+                try {
+                    await downloadFile(drive, remoteFile.id, tempRemotePath);
+                    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(tempRemotePath), vscode.Uri.file(localPath), `${fileName} (Cloud) ↔ (Local)`);
+                    // После сравнения снова вызываем решение конфликта
+                    return await syncFileWithConflictResolution(drive, localPath, remoteFile, machineId, silent);
+                } finally {
+                    if (fsSync.existsSync(tempRemotePath)) await fs.unlink(tempRemotePath).catch(() => {});
+                }
+            }
+
+            if (choice && choice.action === 'download') {
+                await downloadFile(drive, remoteFile.id, localPath);
+            } else if (choice && choice.action === 'upload') {
+                await updateFile(drive, remoteFile.id, localPath, machineId);
+            }
+        }
     }
 }
 
@@ -1793,14 +1863,12 @@ async function findOrCreateAIHistoryManifest(drive, historyFolderId) {
 
     if (files.length > 0) {
         return files[0].id;
-    } else {
-        const { data } = await drive.files.create({
-            resource: { name: fileName, parents: [historyFolderId], mimeType: 'application/json' },
-            media: { mimeType: 'application/json', body: JSON.stringify({ ids: [] }) },
-            fields: 'id'
-        });
-        return data.id;
     }
+}
+
+async function findOrCreateAIKnowledgeFolder(drive, workspaceRoot) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot);
+    return await findOrCreateSubFolder(drive, projectFolderId, 'knowledge');
 }
 
 // --- АУТЕНТИФИКАЦИЯ И УТИЛИТЫ GOOGLE DRIVE ---
@@ -2007,7 +2075,7 @@ async function getAllRemoteFiles(drive, folderId, recursive = false, prefix = ''
     do {
         const res = await drive.files.list({
             q: `'${folderId}' in parents and trashed=false and name != '.deleted'`,
-            fields: 'nextPageToken, files(id, name, md5Checksum, appProperties, mimeType)',
+            fields: 'nextPageToken, files(id, name, md5Checksum, appProperties, mimeType, modifiedTime)',
             pageToken: pageToken,
         });
         
