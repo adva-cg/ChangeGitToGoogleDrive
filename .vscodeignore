@@ -1,1 +1,14 @@
-out
+.vscode-test/**
+.github/**
+.git/**
+out/**
+test/**
+scratch/**
+docs/**
+.gitignore
+.vscodeignore
+vsc-extension-quickstart.md
+webpack.config.js
+CHANGELOG.md
+README.md
+*.vsix
