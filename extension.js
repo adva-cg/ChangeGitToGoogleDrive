@@ -25,6 +25,8 @@ const AI_KNOWLEDGE_LOCAL_PATH = path.join(os.homedir(), '.gemini', 'antigravity'
 const CLIPBOARD_SYNC_FILE_NAME = 'clipboard_sync.json';
 const LAST_CLIPBOARD_HASH_KEY = 'lastClipboardHash';
 const REFS_FILE_NAME = 'refs.json';
+const CLOUD_CONFIG_FILE_NAME = 'config.json';
+const BACKUPS_DIR_NAME = 'backups';
 const CONFLICT_DECISIONS_KEY = 'untrackedConflictDecisions';
 
 function escapeGdriveQueryParam(param) {
@@ -154,6 +156,15 @@ function activate(context) {
 
     // --- ОБЛАЧНЫЙ БУФЕР ОБМЕНА ---
     setupCloudClipboard(context);
+
+    // --- ПЕРИОДИЧЕСКАЯ ОЧИСТКА СТАРЫХ БЭКАПОВ (через 2 мин) ---
+    setTimeout(() => {
+        getAuthenticatedClient(context).then(async (drive) => {
+            if (drive && workspaceRoot) {
+                await cleanupOldBackups(drive, workspaceRoot);
+            }
+        }).catch(e => console.error('Backup cleanup error:', e));
+    }, 120000);
 }
 
 let clipboardInterval;
@@ -208,7 +219,7 @@ async function syncCloudClipboard(context) {
         }
 
         const machineId = vscode.env.machineId;
-        const gdriveGitDirId = await findOrCreateBaseGdriveDir(drive);
+        const gdriveGitDirId = await ensureSingleFolder(drive, null, '.gdrive-git', context);
         if (!gdriveGitDirId) throw new Error("Could not find/create base GDrive folder");
 
         const syncFile = await findClipboardSyncFile(drive, gdriveGitDirId);
@@ -276,22 +287,6 @@ async function findClipboardSyncFile(drive, parentId) {
     return files.length > 0 ? files[0] : null;
 }
 
-async function findOrCreateBaseGdriveDir(drive) {
-    const gdriveGitDir = `.gdrive-git`;
-    let { data: { files: rootFolders } } = await drive.files.list({
-        q: `name='${gdriveGitDir}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-        fields: 'files(id)'
-    });
-
-    if (rootFolders.length === 0) {
-        const { data } = await drive.files.create({
-            resource: { name: gdriveGitDir, mimeType: 'application/vnd.google-apps.folder' },
-            fields: 'id'
-        });
-        return data.id;
-    }
-    return rootFolders[0].id;
-}
 
 async function getLocalClipboard() {
     // 1. Проверяем на картинку через PowerShell
@@ -420,7 +415,8 @@ async function deleteBranchFromDrive(context, branchName) {
         cancellable: false
     }, async (progress) => {
         try {
-            const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
+            const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+            const bundleFolderId = await ensureSingleFolder(drive, projectFolderId, 'bundles', context);
             const sanitizedName = sanitizeBranchNameForDrive(branchName);
 
             // 1. Поиск и удаление бандлов
@@ -435,8 +431,8 @@ async function deleteBranchFromDrive(context, branchName) {
             }
 
             // 2. Создание надгробия (tombstone) для ветки
-            const tombstonesFolderId = await findOrCreateTombstonesFolder(drive, workspaceRoot);
-            const branchTombstonesFolderId = await findOrCreateSubFolder(drive, tombstonesFolderId, 'branches');
+            const tombstonesFolderId = await ensureSingleFolder(drive, projectFolderId, 'tombstones', context);
+            const branchTombstonesFolderId = await ensureSingleFolder(drive, tombstonesFolderId, 'branches', context);
 
             await drive.files.create({
                 resource: {
@@ -470,11 +466,13 @@ async function deleteUntrackedFile(context) {
     if (!drive) return;
 
     try {
-        const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
-        const includePatterns = config.get('include', []);
-        const excludePatterns = config.get('exclude', []);
+        const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+        const effectiveConfig = await getEffectiveConfig(drive, projectFolderId);
+        const includePatterns = effectiveConfig.include;
+        const excludePatterns = effectiveConfig.exclude;
+        
         if (includePatterns.length === 0) {
-            vscode.window.showInformationMessage('Нет настроенных шаблонов для неотслеживаемых файлов.');
+            vscode.window.showInformationMessage('Нет настроенных шаблонов (ни в облаке, ни локально) для неотслеживаемых файлов.');
             return;
         }
 
@@ -507,8 +505,8 @@ async function deleteUntrackedFile(context) {
             return;
         }
 
-        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot);
-        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId);
+        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot, context);
+        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId, context);
         let deletedCount = 0;
         let errorCount = 0;
 
@@ -548,12 +546,12 @@ async function clearTombstones(context) {
     if (!drive) return;
 
     try {
-        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot);
+        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot, context);
         if (!untrackedFolderId) {
             vscode.window.showInformationMessage('Не найдена папка неотслеживаемых файлов.');
             return;
         }
-        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId);
+        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId, context);
 
         const tombstones = await getAllRemoteFiles(drive, deletedFolderId, true);
 
@@ -614,20 +612,8 @@ async function clearConflictDecision(context, key) {
     await context.workspaceState.update(CONFLICT_DECISIONS_KEY, decisions);
 }
 
-async function findOrCreateDeletedFolder(drive, untrackedFolderId) {
-    const folderName = '.deleted';
-    const q = `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${untrackedFolderId}' in parents and trashed=false`;
-    let { data: { files } } = await drive.files.list({ q, fields: 'files(id)' });
-
-    if (files.length > 0) {
-        return files[0].id;
-    } else {
-        const { data } = await drive.files.create({
-            resource: { name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [untrackedFolderId] },
-            fields: 'id'
-        });
-        return data.id;
-    }
+async function findOrCreateDeletedFolder(drive, untrackedFolderId, context) {
+    return await ensureSingleFolder(drive, untrackedFolderId, '.deleted', context);
 }
 
 async function moveFileToDeleted(drive, fileToMove, untrackedFolderId, deletedFolderId) {
@@ -667,17 +653,18 @@ async function syncUntrackedFiles(context, silent = false) {
     }
 
     try {
-        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot);
-        if (!untrackedFolderId) return;
-
-        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId);
+        const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot, context);
+        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId, context);
+        
         const tombstoneSet = await getAllTombstones(drive, deletedFolderId);
         const decisions = getConflictDecisions(context);
-        const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
-        let includePatterns = config.get('include', []);
-        const excludePatterns = config.get('exclude', []);
+        
+        const effectiveConfig = await getEffectiveConfig(drive, projectFolderId);
+        let includePatterns = effectiveConfig.include;
+        const excludePatterns = effectiveConfig.exclude;
+        
         const localUntrackedFiles = await getUntrackedAndIgnoredFiles(workspaceRoot);
-
         const remoteFiles = await getAllRemoteFiles(drive, untrackedFolderId);
 
         // 1. Предложить добавить правила для новых файлов с диска
@@ -698,14 +685,13 @@ async function syncUntrackedFiles(context, silent = false) {
 
                 if (choice === 'Да, добавить') {
                     const newPattern = await vscode.window.showInputBox({
-                        prompt: 'Введите glob-шаблон для добавления в настройки',
+                        prompt: 'Введите glob-шаблон для добавления в ОБЛАЧНЫЙ конфиг',
                         value: remoteFile.name
                     });
                     if (newPattern) {
-                        const newPatterns = [...includePatterns, newPattern];
-                        await config.update('include', newPatterns, vscode.ConfigurationTarget.Global);
-                        includePatterns = newPatterns; // Обновляем локальную копию
-                        vscode.window.showInformationMessage(`Правило "${newPattern}" добавлено. Файл будет загружен при следующей синхронизации.`);
+                        includePatterns = [...includePatterns, newPattern];
+                        await updateCloudConfig(drive, projectFolderId, { include: includePatterns, exclude: excludePatterns });
+                        vscode.window.showInformationMessage(`Правило "${newPattern}" добавлено в облачный конфиг проекта.`);
                     }
                 } else if (choice === 'Нет и не спрашивать снова') {
                     await setConflictDecision(context, { key: decisionKey, data: { decision: 'ignore_suggestion' } });
@@ -848,18 +834,20 @@ async function uploadUntrackedFiles(context, silent = false) {
     }
 
     try {
-        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot);
+        const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot, context);
         if (!untrackedFolderId) return;
 
-        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId);
+        const deletedFolderId = await findOrCreateDeletedFolder(drive, untrackedFolderId, context);
         const tombstoneSet = await getAllTombstones(drive, deletedFolderId);
         const decisions = getConflictDecisions(context);
 
-        const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
-        const includePatterns = config.get('include', []);
-        const excludePatterns = config.get('exclude', []);
+        const effectiveConfig = await getEffectiveConfig(drive, projectFolderId);
+        const includePatterns = effectiveConfig.include;
+        const excludePatterns = effectiveConfig.exclude;
+        
         if (includePatterns.length === 0) {
-            if (!silent) vscode.window.showInformationMessage('Нет настроенных шаблонов для выгрузки.');
+            if (!silent) vscode.window.showInformationMessage('Нет настроенных шаблонов (ни в облаке, ни локально) для выгрузки.');
             return;
         }
 
@@ -1046,7 +1034,7 @@ async function sync(context, silent = false) {
         const workspaceRoot = getWorkspaceRoot();
         if (!workspaceRoot) return;
 
-        const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
+        const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot, context);
         if (!bundleFolderId) {
             throw new Error('Could not find or create project folder on Google Drive.');
         }
@@ -1073,8 +1061,8 @@ async function checkRemoteBranchTombstones(context, drive, bundleFolderId, silen
     if (!workspaceRoot) return;
 
     try {
-        const tombstonesFolderId = await findOrCreateTombstonesFolder(drive, workspaceRoot);
-        const branchTombstonesFolderId = await findOrCreateSubFolder(drive, tombstonesFolderId, 'branches');
+        const tombstonesFolderId = await findOrCreateTombstonesFolder(drive, workspaceRoot, context);
+        const branchTombstonesFolderId = await findOrCreateSubFolder(drive, tombstonesFolderId, 'branches', context);
 
         const { data: { files: tombstones } } = await drive.files.list({
             q: `'${branchTombstonesFolderId}' in parents and trashed=false`,
@@ -1380,27 +1368,18 @@ async function cloneFromGoogleDrive(context) {
     if (!drive) return;
 
     try {
-        const { data: { files: rootFolders } } = await drive.files.list({
-            q: `name='.gdrive-git' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+        const rootFolderId = await ensureSingleFolder(drive, null, '.gdrive-git', context);
+        const { data: { files: projects } } = await drive.files.list({
+            q: `'${rootFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
             fields: 'files(id, name)'
         });
-        if (rootFolders.length === 0) {
+        if (projects.length === 0) {
             vscode.window.showErrorMessage('No projects found on Google Drive. Please perform an initial upload from a source repository first.');
-            return;
-        }
-        const rootFolderId = rootFolders[0].id;
-
-        const { data: { files: projectFolders } } = await drive.files.list({
-            q: `mimeType='application/vnd.google-apps.folder' and '${rootFolderId}' in parents and trashed=false`,
-            fields: 'files(id, name)'
-        });
-        if (projectFolders.length === 0) {
-            vscode.window.showErrorMessage('No projects found in the .gdrive-git folder.');
             return;
         }
 
         const selectedProject = await vscode.window.showQuickPick(
-            projectFolders.map(f => ({ label: f.name, description: `(ID: ${f.id})`, id: f.id })),
+            projects.map(f => ({ label: f.name, description: `(ID: ${f.id})`, id: f.id })),
             { placeHolder: 'Select the project to clone' }
         );
         if (!selectedProject) return;
@@ -1543,7 +1522,7 @@ async function manageSyncHash(context) {
     // --- Sync with Drive ---
     try {
         const drive = await getAuthenticatedClient(context);
-        const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot);
+        const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot, context);
         if (bundleFolderId) {
             const remoteRefs = await getRemoteRefs(drive, bundleFolderId);
             if (newHash === undefined) {
@@ -1696,7 +1675,7 @@ async function syncAIHistory(context, silent = false) {
     if (!silent) vscode.window.showInformationMessage('Синхронизация истории AI с Google Drive...');
 
     try {
-        const historyFolderId = await findOrCreateAIHistoryFolder(drive, workspaceRoot);
+        const historyFolderId = await findOrCreateAIHistoryFolder(drive, workspaceRoot, context);
         const manifestFileId = await findOrCreateAIHistoryManifest(drive, historyFolderId);
 
         // 1. Загружаем манифест с диска (чтобы узнать о чатах с других машин)
@@ -1720,7 +1699,8 @@ async function syncAIHistory(context, silent = false) {
         for (const convId of allRelevantIds) {
             const localPath = path.join(AI_HISTORY_LOCAL_PATH, convId);
             const localPbPath = path.join(AI_HISTORY_CONVERSATIONS_PATH, `${convId}.pb`);
-            const remoteConvFolderId = await findOrCreateSubFolder(drive, historyFolderId, convId);
+            // Для подпапок бесед используем простой поиск/создание, чтобы не спамить уведомлениями о слиянии (если их несколько)
+            const remoteConvFolderId = await findOrCreateSubFolder(drive, historyFolderId, convId, context);
 
             if (fsSync.existsSync(localPath)) {
                 await syncFolder(drive, localPath, remoteConvFolderId, machineId, silent);
@@ -1746,7 +1726,7 @@ async function syncAIHistory(context, silent = false) {
         }
 
         // 2. Синхронизируем Базу Знаний (Knowledge Items) целиком
-        const knowledgeFolderId = await findOrCreateAIKnowledgeFolder(drive, workspaceRoot);
+        const knowledgeFolderId = await findOrCreateAIKnowledgeFolder(drive, workspaceRoot, context);
         await syncFolder(drive, AI_KNOWLEDGE_LOCAL_PATH, knowledgeFolderId, machineId, silent);
 
         // 3. Обновляем манифест на диске и локально
@@ -1854,9 +1834,9 @@ async function downloadFolder(drive, remoteFolderId, localPath, silent) {
     }
 }
 
-async function findOrCreateAIHistoryFolder(drive, workspaceRoot) {
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot);
-    return await findOrCreateSubFolder(drive, projectFolderId, 'ai-history');
+async function findOrCreateAIHistoryFolder(drive, workspaceRoot, context) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+    return await ensureSingleFolder(drive, projectFolderId, 'ai-history', context);
 }
 
 async function findOrCreateAIHistoryManifest(drive, historyFolderId) {
@@ -1869,9 +1849,9 @@ async function findOrCreateAIHistoryManifest(drive, historyFolderId) {
     }
 }
 
-async function findOrCreateAIKnowledgeFolder(drive, workspaceRoot) {
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot);
-    return await findOrCreateSubFolder(drive, projectFolderId, 'knowledge');
+async function findOrCreateAIKnowledgeFolder(drive, workspaceRoot, context) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+    return await ensureSingleFolder(drive, projectFolderId, 'knowledge', context);
 }
 
 // --- АУТЕНТИФИКАЦИЯ И УТИЛИТЫ GOOGLE DRIVE ---
@@ -1982,7 +1962,6 @@ async function getAuthenticatedClient(context) {
             const detailedMessage = error.message.includes('invalid_grant') 
                 ? "Сессия Google отозвана или недействительна (invalid_grant). Возможно, из-за смены пароля или входа с другого устройства."
                 : error.message;
-            
             vscode.window.showErrorMessage(
                 `Failed to refresh token: ${detailedMessage}. Please run the 'Authenticate with Google' command again. (Check 'Toggle Developer Tools' for details)`,
                 { modal: true }
@@ -1993,70 +1972,201 @@ async function getAuthenticatedClient(context) {
     return google.drive({ version: 'v3', auth: oauth2Client });
 }
 
-// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-
-async function findOrCreateProjectFolders(drive, workspaceRoot) {
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot);
-    return await findOrCreateSubFolder(drive, projectFolderId, 'bundles');
+async function findOrCreateProjectFolders(drive, workspaceRoot, context) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+    return await ensureSingleFolder(drive, projectFolderId, 'bundles', context);
 }
 
-async function findOrCreateUntrackedFilesFolder(drive, workspaceRoot) {
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot);
-    return await findOrCreateSubFolder(drive, projectFolderId, 'untracked');
+async function findOrCreateUntrackedFilesFolder(drive, workspaceRoot, context) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+    return await ensureSingleFolder(drive, projectFolderId, 'untracked', context);
 }
 
-async function findOrCreateTombstonesFolder(drive, workspaceRoot) {
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot);
-    return await findOrCreateSubFolder(drive, projectFolderId, 'tombstones');
+async function findOrCreateTombstonesFolder(drive, workspaceRoot, context) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+    return await ensureSingleFolder(drive, projectFolderId, 'tombstones', context);
 }
 
-async function findOrCreateBaseProjectFolder(drive, workspaceRoot) {
+async function findOrCreateBaseProjectFolder(drive, workspaceRoot, context) {
     const projectName = path.basename(workspaceRoot);
-    const gdriveGitDir = `.gdrive-git`;
+    const rootFolderId = await ensureSingleFolder(drive, null, '.gdrive-git', context);
 
-    let { data: { files: rootFolders } } = await drive.files.list({
-        q: `name='${gdriveGitDir}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-        fields: 'files(id)'
-    });
+    return await ensureSingleFolder(drive, rootFolderId, projectName, context);
+}
 
-    let rootFolderId;
-    if (rootFolders.length === 0) {
-        const { data } = await drive.files.create({
-            resource: { name: gdriveGitDir, mimeType: 'application/vnd.google-apps.folder' },
-            fields: 'id'
-        });
-        rootFolderId = data.id;
-    } else {
-        rootFolderId = rootFolders[0].id;
-    }
+async function findOrCreateSubFolder(drive, parentId, folderName, context) {
+    return await ensureSingleFolder(drive, parentId, folderName, context);
+}
 
-    const q = `name='${escapeGdriveQueryParam(projectName)}' and mimeType='application/vnd.google-apps.folder' and '${rootFolderId}' in parents and trashed=false`;
-    let { data: { files: projectFolders } } = await drive.files.list({ q: q, fields: 'files(id)' });
+// --- УПРАВЛЕНИЕ ПАПКАМИ И СЛИЯНИЕ ---
 
-    if (projectFolders.length === 0) {
-        const { data } = await drive.files.create({
-            resource: { name: projectName, mimeType: 'application/vnd.google-apps.folder', parents: [rootFolderId] },
-            fields: 'id'
-        });
+async function ensureSingleFolder(drive, parentId, folderName, context) {
+    const q = `name='${escapeGdriveQueryParam(folderName)}' and mimeType='application/vnd.google-apps.folder' and ${parentId ? `'${parentId}' in parents` : "'root' in parents"} and trashed=false`;
+    let { data: { files } } = await drive.files.list({ q, fields: 'files(id, name, createdTime)' });
+
+    if (files.length === 0) {
+        const resource = { name: folderName, mimeType: 'application/vnd.google-apps.folder' };
+        if (parentId) resource.parents = [parentId];
+        const { data } = await drive.files.create({ resource, fields: 'id' });
         return data.id;
+    } else if (files.length === 1) {
+        return files[0].id;
     } else {
-        return projectFolders[0].id;
+        // Найдены дубликаты!
+        return await reconcileFolderDuplicates(drive, files, folderName, parentId, context);
     }
 }
 
-async function findOrCreateSubFolder(drive, parentId, folderName) {
-    const q = `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`;
-    let { data: { files: folders } } = await drive.files.list({ q, fields: 'files(id)' });
+async function reconcileFolderDuplicates(drive, folders, folderName, parentId, context) {
+    vscode.window.showInformationMessage(`Обнаружены дубликаты папки "${folderName}". Начинаю автоматическое объединение...`);
+    
+    // Сортируем по времени создания: самая старая становится основной
+    folders.sort((a, b) => new Date(a.createdTime) - new Date(b.createdTime));
+    const primaryFolder = folders[0];
+    const duplicates = folders.slice(1);
 
-    if (folders.length === 0) {
-        const { data } = await drive.files.create({
-            resource: { name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] },
-            fields: 'id'
+    const workspaceRoot = getWorkspaceRoot();
+    const backupBaseId = await findOrCreateBackupsFolder(drive, workspaceRoot, context);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupSessionId = await ensureSingleFolder(drive, backupBaseId, `merge_${folderName}_${timestamp}`, context);
+
+    for (const dup of duplicates) {
+        await mergeFoldersRecursive(drive, primaryFolder.id, dup.id, backupSessionId);
+        // Перемещаем теперь уже пустой дубликат в бэкап
+        await drive.files.update({
+            fileId: dup.id,
+            addParents: backupSessionId,
+            removeParents: parentId || 'root',
+            fields: 'id, parents'
         });
-        return data.id;
-    } else {
-        return folders[0].id;
     }
+
+    vscode.window.showInformationMessage(`Объединение папки "${folderName}" завершено. Старые версии сохранены в .gdrive-git/backups.`);
+    return primaryFolder.id;
+}
+
+async function mergeFoldersRecursive(drive, targetFolderId, sourceFolderId, backupFolderId) {
+    const sourceItems = await getAllRemoteFiles(drive, sourceFolderId);
+    const targetItems = await getAllRemoteFiles(drive, targetFolderId);
+    const targetMap = new Map(targetItems.map(i => [i.name, i]));
+
+    for (const item of sourceItems) {
+        const targetItem = targetMap.get(item.name);
+
+        if (item.mimeType === 'application/vnd.google-apps.folder') {
+            if (targetItem && targetItem.mimeType === 'application/vnd.google-apps.folder') {
+                // Рекурсивно объединяем подпапки
+                const subBackupId = await ensureSingleFolder(drive, backupFolderId, item.name);
+                await mergeFoldersRecursive(drive, targetItem.id, item.id, subBackupId);
+            } else {
+                // Переносим папку целиком
+                if (targetItem) {
+                    await drive.files.update({ fileId: targetItem.id, addParents: backupFolderId, removeParents: targetFolderId });
+                }
+                await drive.files.update({ fileId: item.id, addParents: targetFolderId, removeParents: sourceFolderId });
+            }
+        } else {
+            // Это файл
+            if (targetItem) {
+                const sourceTime = new Date(item.modifiedTime).getTime();
+                const targetTime = new Date(targetItem.modifiedTime).getTime();
+
+                if (sourceTime > targetTime) {
+                    await drive.files.update({ fileId: targetItem.id, addParents: backupFolderId, removeParents: targetFolderId });
+                    await drive.files.update({ fileId: item.id, addParents: targetFolderId, removeParents: sourceFolderId });
+                } else {
+                    await drive.files.update({ fileId: item.id, addParents: backupFolderId, removeParents: sourceFolderId });
+                }
+            } else {
+                await drive.files.update({ fileId: item.id, addParents: targetFolderId, removeParents: sourceFolderId });
+            }
+        }
+    }
+}
+
+async function cleanupOldBackups(drive, workspaceRoot) {
+    try {
+        const backupsFolderId = await findOrCreateBackupsFolder(drive, workspaceRoot);
+        const { data: { files: sessions } } = await drive.files.list({
+            q: `'${backupsFolderId}' in parents and trashed=false`,
+            fields: 'files(id, name, createdTime)'
+        });
+
+        const now = new Date();
+        const thirtyDaysInMs = 30 * 24 * 60 * 60 * 1000;
+
+        for (const session of sessions) {
+            const createdTime = new Date(session.createdTime).getTime();
+            if (now.getTime() - createdTime > thirtyDaysInMs) {
+                console.log(`Cleaning up old backup session: ${session.name}`);
+                await drive.files.delete({ fileId: session.id });
+            }
+        }
+    } catch (e) {
+        console.error('Error during backups cleanup:', e);
+    }
+}
+
+async function findOrCreateBackupsFolder(drive, workspaceRoot, context) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+    // Для backups используем простую проверку, чтобы не уходить в бесконечный цикл рекурсии
+    const q = `name='${BACKUPS_DIR_NAME}' and mimeType='application/vnd.google-apps.folder' and '${projectFolderId}' in parents and trashed=false`;
+    const { data: { files } } = await drive.files.list({ q, fields: 'files(id)' });
+    if (files.length > 0) return files[0].id;
+    
+    const { data } = await drive.files.create({
+        resource: { name: BACKUPS_DIR_NAME, mimeType: 'application/vnd.google-apps.folder', parents: [projectFolderId] },
+        fields: 'id'
+    });
+    return data.id;
+}
+
+// --- КЛОУД-КОНФИГ (Cloud Config) ---
+
+async function getCloudConfig(drive, projectFolderId) {
+    const q = `name='${CLOUD_CONFIG_FILE_NAME}' and '${projectFolderId}' in parents and trashed=false`;
+    const { data: { files } } = await drive.files.list({ q, fields: 'files(id)' });
+    
+    if (files.length === 0) return null;
+
+    try {
+        const { data } = await drive.files.get({ fileId: files[0].id, alt: 'media' });
+        // Обработка разных форматов ответа
+        if (typeof data === 'string') return JSON.parse(data);
+        return data;
+    } catch (e) {
+        console.error('Error reading cloud config:', e);
+        return null;
+    }
+}
+
+async function updateCloudConfig(drive, projectFolderId, config) {
+    const q = `name='${CLOUD_CONFIG_FILE_NAME}' and '${projectFolderId}' in parents and trashed=false`;
+    const { data: { files } } = await drive.files.list({ q, fields: 'files(id)' });
+
+    const media = {
+        mimeType: 'application/json',
+        body: JSON.stringify(config, null, 2)
+    };
+
+    if (files.length > 0) {
+        await drive.files.update({ fileId: files[0].id, media });
+    } else {
+        await drive.files.create({
+            resource: { name: CLOUD_CONFIG_FILE_NAME, parents: [projectFolderId] },
+            media
+        });
+    }
+}
+
+async function getEffectiveConfig(drive, projectFolderId) {
+    const cloudConfig = await getCloudConfig(drive, projectFolderId);
+    const localConfig = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
+    
+    return {
+        include: cloudConfig?.include || localConfig.get('include', []),
+        exclude: cloudConfig?.exclude || localConfig.get('exclude', [])
+    };
 }
 
 async function uploadBundleFile(drive, filePath, parentFolderId) {
