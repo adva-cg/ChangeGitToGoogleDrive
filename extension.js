@@ -478,15 +478,8 @@ async function deleteUntrackedFile(context) {
             return;
         }
 
-        const { stdout: allIgnoredFilesStr } = await runCommand('git -c core.quotePath=false ls-files --others --ignored --exclude-standard', workspaceRoot);
-        const allIgnoredFiles = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => f);
-        const filesToList = allIgnoredFiles.filter(file => {
-            if (!file) return false;
-            const isIncluded = includePatterns.some(p => minimatch(file, p, { matchBase: true }));
-            if (!isIncluded) return false;
-            const isExcluded = excludePatterns.some(p => minimatch(file, p, { matchBase: true }));
-            return !isExcluded;
-        }).sort();
+        const allUntrackedFiles = await getUntrackedAndIgnoredFiles(workspaceRoot);
+        const filesToList = allUntrackedFiles.filter(file => isFileIncluded(file, includePatterns, excludePatterns)).sort();
 
         if (filesToList.length === 0) {
             vscode.window.showInformationMessage('Не найдено неотслеживаемых файлов, соответствующих шаблонам.');
@@ -683,14 +676,15 @@ async function syncUntrackedFiles(context, silent = false) {
         const config = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
         let includePatterns = config.get('include', []);
         const excludePatterns = config.get('exclude', []);
+        const localUntrackedFiles = await getUntrackedAndIgnoredFiles(workspaceRoot);
 
         const remoteFiles = await getAllRemoteFiles(drive, untrackedFolderId);
 
         // 1. Предложить добавить правила для новых файлов с диска
         for (const remoteFile of remoteFiles) {
             const localPath = path.join(workspaceRoot, remoteFile.name);
-            const isIncluded = includePatterns.some(p => minimatch(remoteFile.name, p));
-            const isExcluded = excludePatterns.some(p => minimatch(remoteFile.name, p));
+            const isIncluded = isFileIncluded(remoteFile.name, includePatterns, excludePatterns);
+            const isExcluded = false; // isFileIncluded уже учитывает исключения
 
             if (!fsSync.existsSync(localPath) && !isIncluded && !isExcluded) {
                 const decisionKey = `suggest_track_${remoteFile.name}`;
@@ -709,7 +703,7 @@ async function syncUntrackedFiles(context, silent = false) {
                     });
                     if (newPattern) {
                         const newPatterns = [...includePatterns, newPattern];
-                        await config.update('include', newPatterns, vscode.ConfigurationTarget.Workspace);
+                        await config.update('include', newPatterns, vscode.ConfigurationTarget.Global);
                         includePatterns = newPatterns; // Обновляем локальную копию
                         vscode.window.showInformationMessage(`Правило "${newPattern}" добавлено. Файл будет загружен при следующей синхронизации.`);
                     }
@@ -750,10 +744,9 @@ async function syncUntrackedFiles(context, silent = false) {
         // 3. Обработать остальные файлы
         const machineId = vscode.env.machineId;
         for (const remoteFile of remoteFiles) {
-            const isIncluded = includePatterns.some(p => minimatch(remoteFile.name, p));
-            const isExcluded = excludePatterns.some(p => minimatch(remoteFile.name, p));
+            const isIncluded = isFileIncluded(remoteFile.name, includePatterns, excludePatterns);
 
-            if (tombstoneSet.has(remoteFile.name) || !isIncluded || isExcluded) {
+            if (tombstoneSet.has(remoteFile.name) || !isIncluded) {
                 continue;
             }
 
@@ -818,6 +811,22 @@ async function syncUntrackedFiles(context, silent = false) {
             }
         }
 
+        // 4. Загрузить новые локальные файлы, которых нет на Google Drive
+        const remoteFileNames = new Set(remoteFiles.map(f => f.name));
+        for (const relativePath of localUntrackedFiles) {
+            if (remoteFileNames.has(relativePath)) continue;
+            if (tombstoneSet.has(relativePath)) continue;
+            if (!isFileIncluded(relativePath, includePatterns, excludePatterns)) continue;
+
+            const absolutePath = path.join(workspaceRoot, relativePath);
+            try {
+                await uploadFile(drive, untrackedFolderId, absolutePath, machineId);
+                if (!silent) vscode.window.showInformationMessage(`Новый файл выгружен: ${relativePath}`);
+            } catch (error) {
+                vscode.window.showErrorMessage(`Ошибка выгрузки ${relativePath}: ${error.message}`);
+            }
+        }
+
         if (!silent) {
             vscode.window.showInformationMessage('Синхронизация неотслеживаемых файлов завершена.');
         }
@@ -854,14 +863,8 @@ async function uploadUntrackedFiles(context, silent = false) {
             return;
         }
 
-        const { stdout: allIgnoredFilesStr } = await runCommand('git -c core.quotePath=false ls-files --others --ignored --exclude-standard', workspaceRoot);
-        const filesToUpload = allIgnoredFilesStr.trim().split(/\r\n|\n/).filter(f => {
-            if (!f) return false;
-            const isIncluded = includePatterns.some(p => minimatch(f, p, { matchBase: true }));
-            if (!isIncluded) return false;
-            const isExcluded = excludePatterns.some(p => minimatch(f, p, { matchBase: true }));
-            return !isExcluded;
-        });
+        const allUntrackedFiles = await getUntrackedAndIgnoredFiles(workspaceRoot);
+        const filesToUpload = allUntrackedFiles.filter(f => isFileIncluded(f, includePatterns, excludePatterns));
 
         if (filesToUpload.length === 0 && !silent) {
             vscode.window.showInformationMessage('Не найдено файлов для выгрузки, соответствующих шаблонам.');
@@ -2173,6 +2176,84 @@ function sanitizeBranchNameForDrive(branchName) {
 function restoreBranchNameFromDrive(driveBranchName) {
     if (!driveBranchName) return "";
     return driveBranchName.replace(/_/g, '/');
+}
+
+async function getFilesRecursively(dir, baseDir) {
+    let results = [];
+    const list = await fs.readdir(dir, { withFileTypes: true });
+    for (const file of list) {
+        const res = path.resolve(dir, file.name);
+        if (file.isDirectory()) {
+            results = results.concat(await getFilesRecursively(res, baseDir));
+        } else {
+            const relative = path.relative(baseDir, res).replace(/\\/g, '/');
+            results.push(relative);
+        }
+    }
+    return results;
+}
+
+async function getUntrackedAndIgnoredFiles(workspaceRoot) {
+    try {
+        // 1. Получаем список отдельных игнорируемых файлов
+        const { stdout: filesStr } = await runCommand('git -c core.quotePath=false ls-files --others --ignored --exclude-standard', workspaceRoot);
+        const files = filesStr.trim().split(/\r\n|\n/).filter(f => f);
+
+        // 2. Получаем список игнорируемых директорий
+        const { stdout: dirsStr } = await runCommand('git -c core.quotePath=false ls-files --others --ignored --exclude-standard --directory', workspaceRoot);
+        const { stdout: untrackedDirsStr } = await runCommand('git -c core.quotePath=false ls-files --others --exclude-standard --directory', workspaceRoot);
+        const dirs = [...new Set([
+            ...dirsStr.trim().split(/\r\n|\n/).filter(d => d),
+            ...untrackedDirsStr.trim().split(/\r\n|\n/).filter(d => d)
+        ])];
+
+        let allFiles = new Set(files);
+
+        for (const dir of dirs) {
+            const sanitizedDir = dir.replace(/\\/g, '/').replace(/\/$/, '');
+            const fullPath = path.join(workspaceRoot, sanitizedDir);
+            try {
+                const stat = await fs.stat(fullPath);
+                if (stat.isDirectory()) {
+                    const subFiles = await getFilesRecursively(fullPath, workspaceRoot);
+                    subFiles.forEach(f => allFiles.add(f));
+                } else {
+                    allFiles.add(sanitizedDir);
+                }
+            } catch (e) {
+                // Путь может не существовать
+            }
+        }
+        return Array.from(allFiles).sort();
+    } catch (error) {
+        console.error('Error getting untracked files:', error);
+        return [];
+    }
+}
+
+function isFileIncluded(filePath, includePatterns, excludePatterns) {
+    if (!includePatterns || includePatterns.length === 0) return false;
+
+    const sanitizePattern = (p) => p.replace(/\\/g, '/').replace(/\/$/, '');
+    const sanitizedIncludes = includePatterns.map(sanitizePattern);
+    const sanitizedExcludes = (excludePatterns || []).map(sanitizePattern);
+
+    const checkMatch = (f, p) => {
+        if (minimatch(f, p, { matchBase: true })) return true;
+        // Умная проверка для папок: если файл внутри папки-шаблона
+        if (f.startsWith(p + '/') || f === p) return true;
+        return false;
+    };
+
+    const isIncluded = sanitizedIncludes.some(p => checkMatch(filePath, p));
+    if (!isIncluded) return false;
+
+    if (sanitizedExcludes.length > 0) {
+        const isExcluded = sanitizedExcludes.some(p => checkMatch(filePath, p));
+        if (isExcluded) return false;
+    }
+
+    return true;
 }
 
 function getWorkspaceRoot() {
