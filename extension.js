@@ -820,7 +820,7 @@ async function syncUntrackedFiles(context, silent = false) {
 
             const absolutePath = path.join(workspaceRoot, relativePath);
             try {
-                await uploadFile(drive, untrackedFolderId, absolutePath, machineId);
+                await uploadFile(drive, untrackedFolderId, absolutePath, relativePath, machineId);
                 if (!silent) vscode.window.showInformationMessage(`Новый файл выгружен: ${relativePath}`);
             } catch (error) {
                 vscode.window.showErrorMessage(`Ошибка выгрузки ${relativePath}: ${error.message}`);
@@ -960,7 +960,7 @@ async function uploadUntrackedFiles(context, silent = false) {
                         }
                     }
                 } else {
-                    await createFile(drive, untrackedFolderId, absolutePath, relativePath, machineId);
+                    await uploadFile(drive, untrackedFolderId, absolutePath, relativePath, machineId);
                     if (!silent) vscode.window.showInformationMessage(`Создан: ${relativePath}`);
                 }
             } catch (error) {
@@ -1738,7 +1738,7 @@ async function syncAIHistory(context, silent = false) {
                 if (remotePbFile) {
                     await syncFileWithConflictResolution(drive, localPbPath, remotePbFile, machineId, silent);
                 } else {
-                    await createFile(drive, remoteConvFolderId, localPbPath, pbFileNameOnDrive, machineId);
+                    await uploadFile(drive, remoteConvFolderId, localPbPath, pbFileNameOnDrive, machineId);
                 }
             } else if (remotePbFile) {
                 await downloadFile(drive, remotePbFile.id, localPbPath);
@@ -1784,7 +1784,7 @@ async function syncFolder(drive, localPath, remoteFolderId, machineId, silent) {
                 if (remoteFile) {
                     await syncFileWithConflictResolution(drive, localEntryPath, remoteFile, machineId, silent);
                 } else {
-                    await createFile(drive, remoteFolderId, localEntryPath, entry, machineId);
+                    await uploadFile(drive, remoteFolderId, localEntryPath, entry, machineId);
                 }
             }
         }
@@ -2144,7 +2144,7 @@ async function findRemoteFile(drive, folderId, fileName) {
     return res.data.files[0];
 }
 
-async function createFile(drive, folderId, filePath, relativePath, machineId) {
+async function uploadFile(drive, folderId, filePath, relativePath, machineId) {
     const fileName = relativePath.replace(/\\/g, '/');
     const media = { mimeType: 'application/octet-stream', body: fsSync.createReadStream(filePath) };
     await drive.files.create({
