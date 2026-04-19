@@ -39,7 +39,7 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
     if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
 
     // Acquire Lock
-    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'Untracked Sync', silent);
+    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'untracked', 'Untracked Sync', silent);
     if (!lockAcquired) return;
 
     if (!silent) vscode.window.showInformationMessage('Синхронизация неотслеживаемых файлов...');
@@ -140,7 +140,7 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
     } catch (e: any) {
         vscode.window.showErrorMessage(`Sync failed: ${e.message}`);
     } finally {
-        await LockManager.releaseLock(drive);
+        await LockManager.releaseLock(drive, 'untracked');
     }
 }
 
@@ -153,7 +153,7 @@ export async function uploadUntrackedFiles(context: vscode.ExtensionContext, _si
     if (!projectFolderId) return;
 
     // Acquire Lock (silent background sync)
-    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'Untracked Background Sync', true);
+    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'untracked', 'Untracked Background Sync', true);
     if (!lockAcquired) return;
 
     try {
@@ -176,7 +176,7 @@ export async function uploadUntrackedFiles(context: vscode.ExtensionContext, _si
         }
     } catch (e: any) {
     } finally {
-        await LockManager.releaseLock(drive);
+        await LockManager.releaseLock(drive, 'untracked');
     }
 }
 

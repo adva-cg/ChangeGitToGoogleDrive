@@ -14,40 +14,40 @@ import { getWorkspaceRoot } from '../utils/common';
 const LOCK_STALE_MS = 10 * 60 * 1000; // 10 minutes
 
 export class LockManager {
-    private static isLocalSyncInProgress = false;
-    private static remoteLockId: string | undefined = undefined;
-    private static heartbeatInterval: NodeJS.Timeout | undefined = undefined;
+    // Maps category to state
+    private static activeLocks = new Set<string>();
+    private static remoteLockIds = new Map<string, string>();
+    private static heartbeatIntervals = new Map<string, NodeJS.Timeout>();
     private static sessionId = `${vscode.env.machineId}-${process.pid}`;
 
-    private static getLocalLockPath(): string | null {
+    private static getLocalLockPath(category: string): string | null {
         const root = getWorkspaceRoot();
         if (!root) return null;
-        return path.join(root, '.git', '.sync.lock.local');
+        const fileName = `.${category}.sync.lock.local`;
+        return path.join(root, '.git', fileName);
     }
 
-    private static acquireLocalLock(): boolean {
-        const lockPath = this.getLocalLockPath();
+    private static acquireLocalLock(category: string): boolean {
+        const lockPath = this.getLocalLockPath(category);
         if (!lockPath) return false;
 
         if (fs.existsSync(lockPath)) {
             try {
                 const content = fs.readFileSync(lockPath, 'utf8');
                 const lockData = JSON.parse(content);
-                // If it's the same PID, we somehow re-entered (shouldn't happen with isLocalSyncInProgress)
                 if (lockData.pid === process.pid) return true;
                 
-                // Check if process still exists (basic check)
                 try {
                     process.kill(lockData.pid, 0);
-                    // Process exists, lock is valid
                     return false;
                 } catch (e) {
-                    // Process doesn't exist, lock is stale
+                    // Stale lock
                 }
             } catch (e) {}
         }
 
         try {
+            fs.mkdirSync(path.dirname(lockPath), { recursive: true });
             fs.writeFileSync(lockPath, JSON.stringify({
                 pid: process.pid,
                 machineId: vscode.env.machineId,
@@ -55,13 +55,13 @@ export class LockManager {
             }));
             return true;
         } catch (e) {
-            console.error('Failed to create local lock:', e);
+            console.error(`Failed to create local lock for ${category}:`, e);
             return false;
         }
     }
 
-    private static releaseLocalLock() {
-        const lockPath = this.getLocalLockPath();
+    private static releaseLocalLock(category: string) {
+        const lockPath = this.getLocalLockPath(category);
         if (lockPath && fs.existsSync(lockPath)) {
             try {
                 fs.unlinkSync(lockPath);
@@ -69,46 +69,41 @@ export class LockManager {
         }
     }
 
-    static async acquireLock(drive: drive_v3.Drive, projectFolderId: string, componentName: string, silent: boolean): Promise<boolean> {
-        if (this.isLocalSyncInProgress) {
-            if (!silent) vscode.window.showWarningMessage(`Локальная синхронизация (${componentName}) уже в процессе.`);
+    static async acquireLock(drive: drive_v3.Drive, projectFolderId: string, category: string, componentName: string, silent: boolean): Promise<boolean> {
+        if (this.activeLocks.has(category)) {
+            if (!silent) vscode.window.showWarningMessage(`Синхронизация ${componentName} уже запущена в этом окне.`);
             return false;
         }
 
-        // 1. Try to acquire Local Lock (file-based, across processes)
-        if (!this.acquireLocalLock()) {
-            const msg = `Проект заблокирован другим процессом на этой машине.`;
+        if (!this.acquireLocalLock(category)) {
+            const msg = `Синхронизация ${componentName} заблокирована другим процессом на этой машине.`;
             if (!silent) vscode.window.showWarningMessage(msg);
             return false;
         }
 
         const machineId = vscode.env.machineId;
         const hostname = os.hostname();
+        const lockFileName = `.${category}.sync.lock`;
         
-        // 2. Try to acquire Remote Lock (Google Drive)
-        const existingLock = await getRemoteLock(drive, projectFolderId);
+        const existingLock = await getRemoteLock(drive, projectFolderId, lockFileName);
         if (existingLock) {
             const lockData = existingLock.description ? JSON.parse(existingLock.description) : {};
             const lastUpdate = new Date(existingLock.modifiedTime || 0).getTime();
             const now = Date.now();
             
-            // Check if it's our OWN lock (same machine AND same session/process)
             if (lockData.machineId === machineId && lockData.sessionId === this.sessionId) {
-                this.remoteLockId = existingLock.id!;
-                await this.startHeartbeat(drive, componentName);
-                this.isLocalSyncInProgress = true;
+                this.remoteLockIds.set(category, existingLock.id!);
+                await this.startHeartbeat(drive, category, componentName);
+                this.activeLocks.add(category);
                 return true;
             }
 
-            // If it's same machine but different session, we already failed at local lock check above,
-            // but just in case, handle it here too.
             if (now - lastUpdate < LOCK_STALE_MS) {
-                const msg = `Проект заблокирован ${lockData.machineId === machineId ? 'другим окном' : 'другой машиной'}: ${lockData.hostname || 'Unknown'} (${lockData.component || 'Processing'}).`;
-                if (!silent) vscode.window.showWarningMessage(msg, { modal: true });
-                this.releaseLocalLock();
+                const msg = `Проект (${componentName}) заблокирован ${lockData.machineId === machineId ? 'другим окном' : 'другой машиной'}: ${lockData.hostname || 'Unknown'}.`;
+                if (!silent) vscode.window.showWarningMessage(msg, { modal: !silent });
+                this.releaseLocalLock(category);
                 return false;
             } else {
-                // Lock is stale, delete it
                 try {
                     await deleteRemoteLock(drive, existingLock.id!);
                 } catch (e) {}
@@ -120,63 +115,68 @@ export class LockManager {
             sessionId: this.sessionId,
             hostname,
             component: componentName,
+            category: category,
             timestamp: new Date().toISOString()
         };
         
         try {
-            await createRemoteLock(drive, projectFolderId, lockData);
-            const newLock = await getRemoteLock(drive, projectFolderId);
+            await createRemoteLock(drive, projectFolderId, lockData, lockFileName);
+            const newLock = await getRemoteLock(drive, projectFolderId, lockFileName);
             if (newLock) {
-                this.remoteLockId = newLock.id!;
-                await this.startHeartbeat(drive, componentName);
-                this.isLocalSyncInProgress = true;
+                this.remoteLockIds.set(category, newLock.id!);
+                await this.startHeartbeat(drive, category, componentName);
+                this.activeLocks.add(category);
                 return true;
             }
         } catch (error: any) {
-            if (!silent) vscode.window.showErrorMessage(`Не удалось создать блокировку: ${error.message}`);
+            if (!silent) vscode.window.showErrorMessage(`Не удалось создать блокировку ${category}: ${error.message}`);
         }
         
-        this.releaseLocalLock();
+        this.releaseLocalLock(category);
         return false;
     }
 
-    static async releaseLock(drive: drive_v3.Drive) {
-        this.stopHeartbeat();
-        if (this.remoteLockId) {
+    static async releaseLock(drive: drive_v3.Drive, category: string) {
+        this.stopHeartbeat(category);
+        const remoteId = this.remoteLockIds.get(category);
+        if (remoteId) {
             try {
-                await deleteRemoteLock(drive, this.remoteLockId);
+                await deleteRemoteLock(drive, remoteId);
             } catch (e) {}
-            this.remoteLockId = undefined;
+            this.remoteLockIds.delete(category);
         }
-        this.releaseLocalLock();
-        this.isLocalSyncInProgress = false;
+        this.releaseLocalLock(category);
+        this.activeLocks.delete(category);
     }
 
-    private static async startHeartbeat(drive: drive_v3.Drive, componentName: string) {
-        this.stopHeartbeat();
-        this.heartbeatInterval = setInterval(async () => {
-            if (this.remoteLockId) {
+    private static async startHeartbeat(drive: drive_v3.Drive, category: string, componentName: string) {
+        this.stopHeartbeat(category);
+        const interval = setInterval(async () => {
+            const remoteId = this.remoteLockIds.get(category);
+            if (remoteId) {
                 const lockData = {
                     machineId: vscode.env.machineId,
                     sessionId: this.sessionId,
                     hostname: os.hostname(),
                     component: componentName,
+                    category: category,
                     timestamp: new Date().toISOString()
                 };
                 try {
-                    await updateRemoteLock(drive, this.remoteLockId, lockData);
+                    await updateRemoteLock(drive, remoteId, lockData);
                 } catch (e) {
-                    console.error('Failed to update heartbeat:', e);
+                    console.error(`Failed to update heartbeat for ${category}:`, e);
                 }
             }
-        }, 2 * 60 * 1000); // every 2 minutes
+        }, 2 * 60 * 1000);
+        this.heartbeatIntervals.set(category, interval);
     }
 
-    private static stopHeartbeat() {
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = undefined;
+    private static stopHeartbeat(category: string) {
+        const interval = this.heartbeatIntervals.get(category);
+        if (interval) {
+            clearInterval(interval);
+            this.heartbeatIntervals.delete(category);
         }
     }
 }
-

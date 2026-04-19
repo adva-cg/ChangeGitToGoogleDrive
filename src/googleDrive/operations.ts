@@ -209,16 +209,16 @@ export async function findOrCreateBackupsFolder(drive: drive_v3.Drive, workspace
     return data.id;
 }
 
-export async function getRemoteLock(drive: drive_v3.Drive, projectFolderId: string) {
-    const q = `name='.sync.lock' and '${projectFolderId}' in parents and trashed=false`;
+export async function getRemoteLock(drive: drive_v3.Drive, projectFolderId: string, lockFileName: string = '.sync.lock') {
+    const q = `name='${lockFileName}' and '${projectFolderId}' in parents and trashed=false`;
     const res = await drive.files.list({ q, fields: 'files(id, name, description, modifiedTime, appProperties)' });
     return res.data.files?.[0];
 }
 
-export async function createRemoteLock(drive: drive_v3.Drive, projectFolderId: string, lockData: any) {
+export async function createRemoteLock(drive: drive_v3.Drive, projectFolderId: string, lockData: any, lockFileName: string = '.sync.lock') {
     await drive.files.create({
         requestBody: {
-            name: '.sync.lock',
+            name: lockFileName,
             parents: [projectFolderId],
             description: JSON.stringify(lockData),
             appProperties: {

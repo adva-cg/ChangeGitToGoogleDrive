@@ -46,7 +46,7 @@ export async function initialUpload(context: vscode.ExtensionContext) {
         if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
 
         // Acquire Remote Lock
-        const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'Git Initial Push', false);
+        const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'git', 'Git Initial Push', false);
         if (!lockAcquired) return;
 
         try {
@@ -59,7 +59,7 @@ export async function initialUpload(context: vscode.ExtensionContext) {
             const remoteRefs = await getRemoteRefs(drive, bundleFolderId);
             await pushCommits(context, drive, bundleFolderId, remoteRefs, false);
         } finally {
-            await LockManager.releaseLock(drive);
+            await LockManager.releaseLock(drive, 'git');
         }
     } catch (error: any) {
         vscode.window.showErrorMessage(`Первоначальная выгрузка не удалась: ${error.message}`);
@@ -77,7 +77,7 @@ export async function sync(context: vscode.ExtensionContext, silent: boolean = f
         if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
 
         // Acquire Lock
-        const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'Git Sync', silent);
+        const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'git', 'Git Sync', silent);
         if (!lockAcquired) return;
 
         try {
@@ -97,7 +97,7 @@ export async function sync(context: vscode.ExtensionContext, silent: boolean = f
 
             if (!silent) vscode.window.showInformationMessage('Sync finished.');
         } finally {
-            await LockManager.releaseLock(drive);
+            await LockManager.releaseLock(drive, 'git');
         }
     } catch (error: any) {
         const errorMsg = `Sync failed: ${error.message}`;

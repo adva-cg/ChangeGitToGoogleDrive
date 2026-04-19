@@ -99,7 +99,7 @@ export async function syncAntigravity(context: vscode.ExtensionContext, silent: 
     if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
 
     // Acquire Lock
-    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'Antigravity Sync', silent);
+    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'antigravity', 'Antigravity Sync', silent);
     if (!lockAcquired) return;
 
     if (!silent) vscode.window.showInformationMessage('Синхронизация Antigravity...');
@@ -163,7 +163,7 @@ export async function syncAntigravity(context: vscode.ExtensionContext, silent: 
     } catch (error: any) {
         vscode.window.showErrorMessage(`Ошибка синхронизации Antigravity: ${error.message}`);
     } finally {
-        await LockManager.releaseLock(drive);
+        await LockManager.releaseLock(drive, 'antigravity');
     }
 }
 
