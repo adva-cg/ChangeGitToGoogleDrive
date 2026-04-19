@@ -56,10 +56,18 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
 
         // Detect manual local deletions
         const lastKnownFiles: string[] = context.workspaceState.get(LAST_KNOWN_UNTRACKED_FILES_KEY, []);
+        const lastKnownFilesSet = new Set(lastKnownFiles);
         const currentFilesSet = new Set(localFiles);
         const remoteFilesMap = new Map(remoteFiles.map(f => [f.name, f]));
         
-        const disappearedFiles = lastKnownFiles.filter(f => !currentFilesSet.has(f) && remoteFilesMap.has(f) && !tombstoneSet.has(f));
+        const disappearedFiles = remoteFiles.filter(f => {
+            const isMissingLocally = !currentFilesSet.has(f.name);
+            const wasKnownLocally = lastKnownFilesSet.has(f.name);
+            const isSameMachine = f.appProperties?.machineId === machineId;
+            const isNotTombstone = !tombstoneSet.has(f.name);
+            
+            return isMissingLocally && isNotTombstone && (wasKnownLocally || isSameMachine);
+        }).map(f => f.name);
 
         if (disappearedFiles.length > 0) {
             const choice = await vscode.window.showWarningMessage(

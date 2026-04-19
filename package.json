@@ -2,7 +2,7 @@
   "name": "changegittogoogledrive-extension",
   "displayName": "ChangeGitToGoogleDrive",
   "description": "A VS Code extension to sync git commits, untracked files, and AI history/knowledge with Google Drive",
-  "version": "1.7.3",
+  "version": "1.7.4",
   "publisher": "VitalyAdadurov",
   "repository": {
     "type": "git",
