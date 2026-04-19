@@ -2,7 +2,7 @@
   "name": "changegittogoogledrive-extension",
   "displayName": "ChangeGitToGoogleDrive",
   "description": "A VS Code extension to sync git commits, untracked files, and AI history/knowledge with Google Drive",
-  "version": "1.7.5",
+  "version": "1.7.6",
   "publisher": "VitalyAdadurov",
   "repository": {
     "type": "git",
@@ -81,12 +81,12 @@
       },
       {
         "command": "changegittogoogledrive-extension.syncAIHistory",
-        "title": "Синхронизировать историю AI",
+        "title": "Синхронизировать Antigravity Sync",
         "category": "Git-To-Google-Drive"
       },
       {
         "command": "changegittogoogledrive-extension.configureAIHistorySync",
-        "title": "Настроить синхронизацию истории AI для этого проекта",
+        "title": "Настроить Antigravity Sync для этого проекта",
         "category": "Git-To-Google-Drive"
       },
       {
@@ -96,7 +96,7 @@
       }
     ],
     "configuration": {
-      "title": "ChangeGitToGoogleDrive Untracked Files",
+      "title": "Antigravity Sync Settings",
       "properties": {
         "changegittogoogledrive-extension.untrackedFiles.include": {
           "type": "array",
@@ -126,12 +126,12 @@
             "always",
             "never"
           ],
-          "description": "Как синхронизировать историю бесед AI (Antigravity). 'ask' - спрашивать для каждого проекта."
+          "description": "Как синхронизировать бесед Antigravity. 'ask' - спрашивать для каждого проекта."
         },
         "changegittogoogledrive-extension.aiHistory.autoSync": {
           "type": "boolean",
           "default": false,
-          "description": "Автоматически синхронизировать историю AI при запуске VS Code."
+          "description": "Автоматически синхронизировать Antigravity Sync при запуске VS Code."
         },
         "changegittogoogledrive-extension.clipboard.syncEnabled": {
           "type": "boolean",

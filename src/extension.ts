@@ -2,9 +2,9 @@ import * as vscode from 'vscode';
 import { setupGoogleCredentials, authenticateWithGoogle } from './googleDrive/auth';
 import { initialUpload, sync, installGitHooks, cloneFromGoogleDrive, manageSyncHash, setupBranchMonitoring } from './git/sync';
 import { uploadUntrackedFiles, syncUntrackedFiles, deleteUntrackedFile, clearTombstones } from './untracked/untrackedSync';
-import { syncAIHistory, configureAIHistorySync, trackCurrentConversation } from './aiHistory/aiSync';
+import { syncAntigravity, configureAntigravitySync, trackCurrentConversation } from './aiHistory/aiSync';
 import { toggleClipboardSync, setupCloudClipboard } from './clipboard/clipboardSync';
-import { AI_HISTORY_LOCAL_PATH, AI_HISTORY_ENABLED_KEY } from './constants';
+import { ANTIGRAVITY_BRAIN_PATH, ANTIGRAVITY_ENABLED_KEY } from './constants';
 import { getWorkspaceRoot } from './utils/common';
 
 export function activate(context: vscode.ExtensionContext) {
@@ -22,8 +22,8 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('changegittogoogledrive-extension.deleteUntrackedFile', () => deleteUntrackedFile(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.clearTombstones', () => clearTombstones(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.manageSyncHash', () => manageSyncHash(context)),
-        vscode.commands.registerCommand('changegittogoogledrive-extension.configureAIHistorySync', () => configureAIHistorySync(context)),
-        vscode.commands.registerCommand('changegittogoogledrive-extension.syncAIHistory', () => syncAIHistory(context)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.configureAIHistorySync', () => configureAntigravitySync(context)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.syncAIHistory', () => syncAntigravity(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.toggleClipboardSync', () => toggleClipboardSync(context))
     );
 
@@ -35,15 +35,15 @@ export function activate(context: vscode.ExtensionContext) {
     // Мониторинг веток
     setupBranchMonitoring(context);
 
-    // Мониторинг AI истории
-    const aiWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(AI_HISTORY_LOCAL_PATH, '**/*'));
+    // Мониторинг Antigravity истории
+    const aiWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(ANTIGRAVITY_BRAIN_PATH, '**/*'));
     aiWatcher.onDidChange(() => {
-        if (context.workspaceState.get(AI_HISTORY_ENABLED_KEY) === true) {
+        if (context.workspaceState.get(ANTIGRAVITY_ENABLED_KEY) === true) {
             trackCurrentConversation(context);
         }
     });
     aiWatcher.onDidCreate(() => {
-        if (context.workspaceState.get(AI_HISTORY_ENABLED_KEY) === true) {
+        if (context.workspaceState.get(ANTIGRAVITY_ENABLED_KEY) === true) {
             trackCurrentConversation(context);
         }
     });
@@ -54,7 +54,7 @@ export function activate(context: vscode.ExtensionContext) {
     if (workspaceRoot) {
         sync(context, true).catch(e => console.error('Initial git sync failed:', e));
         syncUntrackedFiles(context, true).catch(e => console.error('Initial untracked sync failed:', e));
-        syncAIHistory(context, true).catch(e => console.error('Initial AI history sync failed:', e));
+        syncAntigravity(context, true).catch(e => console.error('Initial Antigravity sync failed:', e));
     }
 
     // Настройка облачного буфера обмена
