@@ -208,3 +208,40 @@ export async function findOrCreateBackupsFolder(drive: drive_v3.Drive, workspace
     const { data } = await drive.files.create({ requestBody: { name: BACKUPS_DIR_NAME, mimeType: 'application/vnd.google-apps.folder', parents: [projectFolderId] }, fields: 'id' });
     return data.id;
 }
+
+export async function getRemoteLock(drive: drive_v3.Drive, projectFolderId: string) {
+    const q = `name='.sync.lock' and '${projectFolderId}' in parents and trashed=false`;
+    const res = await drive.files.list({ q, fields: 'files(id, name, description, modifiedTime, appProperties)' });
+    return res.data.files?.[0];
+}
+
+export async function createRemoteLock(drive: drive_v3.Drive, projectFolderId: string, lockData: any) {
+    await drive.files.create({
+        requestBody: {
+            name: '.sync.lock',
+            parents: [projectFolderId],
+            description: JSON.stringify(lockData),
+            appProperties: {
+                machineId: lockData.machineId,
+                timestamp: lockData.timestamp
+            }
+        }
+    });
+}
+
+export async function updateRemoteLock(drive: drive_v3.Drive, fileId: string, lockData: any) {
+    await drive.files.update({
+        fileId: fileId,
+        requestBody: {
+            description: JSON.stringify(lockData),
+            appProperties: {
+                machineId: lockData.machineId,
+                timestamp: lockData.timestamp
+            }
+        }
+    });
+}
+
+export async function deleteRemoteLock(drive: drive_v3.Drive, fileId: string) {
+    await drive.files.delete({ fileId });
+}
