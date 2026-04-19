@@ -10,6 +10,7 @@ export const AI_HISTORY_ENABLED_KEY = 'aiHistoryEnabled'; // Stores true/false/u
 export const AI_HISTORY_IDS_KEY = 'aiHistoryConversationIds'; // Array of IDs for the current project
 export const CONFLICT_DECISIONS_KEY = 'untrackedConflictDecisions';
 export const LAST_CLIPBOARD_HASH_KEY = 'lastClipboardHash';
+export const LAST_KNOWN_UNTRACKED_FILES_KEY = 'lastKnownUntrackedFiles';
 
 // Пути локального окружения
 export const AI_HISTORY_LOCAL_PATH = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');

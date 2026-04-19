@@ -3,7 +3,7 @@ import * as path from 'path';
 import { promises as fs } from 'fs';
 import * as fsSync from 'fs';
 import { minimatch } from 'minimatch';
-import { CONFLICT_DECISIONS_KEY } from '../constants';
+import { CONFLICT_DECISIONS_KEY, LAST_KNOWN_UNTRACKED_FILES_KEY } from '../constants';
 import { 
     getWorkspaceRoot, 
     runCommand, 
@@ -54,6 +54,34 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
         const remoteFiles = await getAllRemoteFiles(drive, untrackedFolderId);
         const machineId = vscode.env.machineId;
 
+        // Detect manual local deletions
+        const lastKnownFiles: string[] = context.workspaceState.get(LAST_KNOWN_UNTRACKED_FILES_KEY, []);
+        const currentFilesSet = new Set(localFiles);
+        const remoteFilesMap = new Map(remoteFiles.map(f => [f.name, f]));
+        
+        const disappearedFiles = lastKnownFiles.filter(f => !currentFilesSet.has(f) && remoteFilesMap.has(f) && !tombstoneSet.has(f));
+
+        if (disappearedFiles.length > 0) {
+            const choice = await vscode.window.showWarningMessage(
+                `Detected ${disappearedFiles.length} locally deleted files. Mark them as deleted on Google Drive too?`,
+                'Yes', 'No'
+            );
+            if (choice === 'Yes') {
+                for (const relPath of disappearedFiles) {
+                    const remote = remoteFilesMap.get(relPath);
+                    if (remote && remote.id) {
+                        const { data: { parents } } = await drive.files.get({ fileId: remote.id, fields: 'parents' });
+                        if (parents?.length && parents[0]) {
+                            await drive.files.update({ fileId: remote.id, addParents: deletedFolderId, removeParents: parents[0] });
+                        }
+                    }
+                }
+                // Refresh remote files
+                const updatedRemoteFiles = await getAllRemoteFiles(drive, untrackedFolderId);
+                remoteFiles.splice(0, remoteFiles.length, ...updatedRemoteFiles);
+            }
+        }
+
         for (const remoteFile of remoteFiles) {
             const localPath = path.join(workspaceRoot, remoteFile.name);
             if (!fsSync.existsSync(localPath) && !isFileIncluded(remoteFile.name, config.include, config.exclude)) {
@@ -98,6 +126,9 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
             if (remoteFileNames.has(relPath) || tombstoneSet.has(relPath) || !isFileIncluded(relPath, config.include, config.exclude)) continue;
             await uploadFile(drive, untrackedFolderId, path.join(workspaceRoot, relPath), relPath, machineId);
         }
+
+        // Update last known state
+        await context.workspaceState.update(LAST_KNOWN_UNTRACKED_FILES_KEY, localFiles);
     } catch (e: any) {
         vscode.window.showErrorMessage(`Sync failed: ${e.message}`);
     } finally {
