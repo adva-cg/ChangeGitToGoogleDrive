@@ -1,8 +1,10 @@
+node_modules/**
+src/**
+test/**
 .vscode-test/**
 .github/**
 .git/**
 out/**
-test/**
 scratch/**
 docs/**
 .gitignore

@@ -2,7 +2,7 @@
   "name": "changegittogoogledrive-extension",
   "displayName": "ChangeGitToGoogleDrive",
   "description": "A VS Code extension to sync git commits, untracked files, and AI history/knowledge with Google Drive",
-  "version": "1.5.3",
+  "version": "1.6.0",
   "publisher": "VitalyAdadurov",
   "repository": {
     "type": "git",
@@ -14,10 +14,14 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [
-    "onStartupFinished"
-  ],
-  "main": "./extension.js",
+  "main": "./dist/extension.js",
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p . && esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "watch": "npm run compile -- --watch",
+    "package": "npx -y @vscode/vsce package",
+    "test": "npm run compile && node ./out/test/runTest.js"
+  },
   "contributes": {
     "commands": [
       {
@@ -143,9 +147,16 @@
     }
   },
   "devDependencies": {
-    "@types/vscode": "^1.85.0",
+    "@types/glob": "^8.1.0",
+    "@types/mocha": "^10.0.10",
     "@types/node": "18.x",
-    "eslint": "^8.56.0"
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^2.5.2",
+    "esbuild": "^0.28.0",
+    "eslint": "^8.56.0",
+    "glob": "^13.0.6",
+    "mocha": "^11.7.5",
+    "typescript": "^6.0.3"
   },
   "dependencies": {
     "googleapis": "^153.0.0",

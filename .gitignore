@@ -2,11 +2,17 @@
 /node_modules
 
 # Build artifacts
+dist/
+out/
 *.vsix
+
+# Testing
+.vscode-test/
 
 # Temporary files created by the extension
 .upload-temp/
 .download-temp/
+scratch/
 
 # Logs
 npm-debug.log*
