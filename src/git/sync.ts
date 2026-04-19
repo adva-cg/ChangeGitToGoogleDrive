@@ -3,7 +3,6 @@ import { drive_v3 } from 'googleapis';
 import * as path from 'path';
 import { promises as fs } from 'fs';
 import * as fsSync from 'fs';
-import * as os from 'os';
 import { 
     LAST_PUSHED_HASH_KEY_PREFIX, 
     PROCESSED_TOMBSTONES_KEY 
@@ -15,17 +14,14 @@ import {
     restoreBranchNameFromDrive 
 } from '../utils/common';
 import { getAuthenticatedClient } from '../googleDrive/auth';
+import { LockManager } from '../googleDrive/lockManager';
 import { 
     findOrCreateProjectFolders, 
     findOrCreateTombstonesFolder, 
     findOrCreateSubFolder,
     ensureSingleFolder,
     downloadFile,
-    findOrCreateBaseProjectFolder,
-    getRemoteLock,
-    createRemoteLock,
-    updateRemoteLock,
-    deleteRemoteLock
+    findOrCreateBaseProjectFolder
 } from '../googleDrive/operations';
 import { 
     getCurrentBranch, 
@@ -35,24 +31,10 @@ import {
 } from './gitUtils';
 
 let lastKnownBranches = new Set<string>();
-let isSyncInProgress = false;
-let remoteLockId: string | undefined = undefined;
-let heartbeatInterval: NodeJS.Timeout | undefined = undefined;
-
-const LOCK_STALE_MS = 10 * 60 * 1000; // 10 minutes
 
 export async function initialUpload(context: vscode.ExtensionContext) {
-    if (isSyncInProgress) {
-        vscode.window.showWarningMessage('Синхронизация уже запущена локально.');
-        return;
-    }
-    isSyncInProgress = true;
-
     const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) {
-        isSyncInProgress = false;
-        return;
-    }
+    if (!workspaceRoot) return;
     try {
         const currentBranch = await getCurrentBranch(workspaceRoot);
         if (!currentBranch) return;
@@ -64,7 +46,7 @@ export async function initialUpload(context: vscode.ExtensionContext) {
         if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
 
         // Acquire Remote Lock
-        const lockAcquired = await acquireRemoteLock(drive, projectFolderId, false);
+        const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'Git Initial Push', false);
         if (!lockAcquired) return;
 
         try {
@@ -77,23 +59,14 @@ export async function initialUpload(context: vscode.ExtensionContext) {
             const remoteRefs = await getRemoteRefs(drive, bundleFolderId);
             await pushCommits(context, drive, bundleFolderId, remoteRefs, false);
         } finally {
-            await releaseRemoteLock(drive);
+            await LockManager.releaseLock(drive);
         }
     } catch (error: any) {
         vscode.window.showErrorMessage(`Первоначальная выгрузка не удалась: ${error.message}`);
-    } finally {
-        isSyncInProgress = false;
     }
 }
 
 export async function sync(context: vscode.ExtensionContext, silent: boolean = false) {
-    if (isSyncInProgress) {
-        if (!silent) vscode.window.showWarningMessage('Синхронизация уже запущена локально.');
-        return;
-    }
-    isSyncInProgress = true;
-
-    if (!silent) vscode.window.showInformationMessage('Syncing with Google Drive...');
     try {
         const drive = await getAuthenticatedClient(context);
         if (!drive) return;
@@ -103,8 +76,8 @@ export async function sync(context: vscode.ExtensionContext, silent: boolean = f
         const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
         if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
 
-        // Acquire Remote Lock
-        const lockAcquired = await acquireRemoteLock(drive, projectFolderId, silent);
+        // Acquire Lock
+        const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'Git Sync', silent);
         if (!lockAcquired) return;
 
         try {
@@ -124,100 +97,22 @@ export async function sync(context: vscode.ExtensionContext, silent: boolean = f
 
             if (!silent) vscode.window.showInformationMessage('Sync finished.');
         } finally {
-            await releaseRemoteLock(drive);
+            await LockManager.releaseLock(drive);
         }
     } catch (error: any) {
+        const errorMsg = `Sync failed: ${error.message}`;
         if (silent) {
-            console.error(`Sync failed: ${error.message}`);
+            console.error(errorMsg);
+            // Don't show modal error for background sync failures, but maybe a status bar message would be better?
+            // For now keep showErrorMessage but without modal.
             vscode.window.showErrorMessage(`Background sync failed: ${error.message}.`);
         } else {
-            vscode.window.showErrorMessage(`Sync failed: ${error.message}`, { modal: true });
-        }
-    } finally {
-        isSyncInProgress = false;
-    }
-}
-
-async function acquireRemoteLock(drive: drive_v3.Drive, projectFolderId: string, silent: boolean): Promise<boolean> {
-    const machineId = vscode.env.machineId;
-    const hostname = os.hostname();
-    
-    const existingLock = await getRemoteLock(drive, projectFolderId);
-    if (existingLock) {
-        const lockData = existingLock.description ? JSON.parse(existingLock.description) : {};
-        const lastUpdate = new Date(existingLock.modifiedTime || 0).getTime();
-        const now = Date.now();
-        
-        if (lockData.machineId === machineId) {
-            // It's our own lock (maybe from a previous crash)
-            remoteLockId = existingLock.id!;
-            await startHeartbeat(drive);
-            return true;
-        }
-
-        if (now - lastUpdate < LOCK_STALE_MS) {
-            const msg = `Синхронизация уже выполняется на другой машине: ${lockData.hostname || 'Unknown'} (${lockData.machineId.substring(0, 8)})`;
-            if (!silent) vscode.window.showWarningMessage(msg, { modal: true });
-            return false;
-        } else {
-            // Lock is stale, delete it
-            await deleteRemoteLock(drive, existingLock.id!);
+            vscode.window.showErrorMessage(errorMsg, { modal: true });
         }
     }
-
-    const lockData = {
-        machineId,
-        hostname,
-        timestamp: new Date().toISOString()
-    };
-    
-    // Create new lock
-    // Since Drive doesn't have an atomic "create if not exists", there's a small window for race conditions, 
-    // but for this personal tool it's usually acceptable.
-    await createRemoteLock(drive, projectFolderId, lockData);
-    const newLock = await getRemoteLock(drive, projectFolderId);
-    if (newLock) {
-        remoteLockId = newLock.id!;
-        await startHeartbeat(drive);
-        return true;
-    }
-    return false;
 }
 
-async function releaseRemoteLock(drive: drive_v3.Drive) {
-    stopHeartbeat();
-    if (remoteLockId) {
-        try {
-            await deleteRemoteLock(drive, remoteLockId);
-        } catch (e) {}
-        remoteLockId = undefined;
-    }
-}
-
-async function startHeartbeat(drive: drive_v3.Drive) {
-    stopHeartbeat();
-    heartbeatInterval = setInterval(async () => {
-        if (remoteLockId) {
-            const lockData = {
-                machineId: vscode.env.machineId,
-                hostname: os.hostname(),
-                timestamp: new Date().toISOString()
-            };
-            try {
-                await updateRemoteLock(drive, remoteLockId, lockData);
-            } catch (e) {
-                console.error('Failed to update heartbeat:', e);
-            }
-        }
-    }, 2 * 60 * 1000); // every 2 minutes
-}
-
-function stopHeartbeat() {
-    if (heartbeatInterval) {
-        clearInterval(heartbeatInterval);
-        heartbeatInterval = undefined;
-    }
-}
+// Removed acquireRemoteLock, releaseRemoteLock, startHeartbeat, stopHeartbeat as they are now in LockManager.
 
 async function checkRemoteBranchTombstones(context: vscode.ExtensionContext, drive: drive_v3.Drive, silent: boolean = false) {
     const workspaceRoot = getWorkspaceRoot();

@@ -21,6 +21,7 @@ import {
     findRemoteFile,
     ensureSingleFolder
 } from '../googleDrive/operations';
+import { LockManager } from '../googleDrive/lockManager';
 import { 
     getConflictDecisions, 
     setConflictDecision, 
@@ -33,9 +34,16 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
     if (!workspaceRoot) return;
     const drive = await getAuthenticatedClient(context);
     if (!drive) return;
+
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+    if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
+
+    // Acquire Lock
+    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'Untracked Sync', silent);
+    if (!lockAcquired) return;
+
     if (!silent) vscode.window.showInformationMessage('Синхронизация неотслеживаемых файлов...');
     try {
-        const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
         const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot, context);
         const deletedFolderId = await ensureSingleFolder(drive, untrackedFolderId, '.deleted', context);
         const tombstones = await getAllRemoteFiles(drive, deletedFolderId, true);
@@ -92,6 +100,8 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
         }
     } catch (e: any) {
         vscode.window.showErrorMessage(`Sync failed: ${e.message}`);
+    } finally {
+        await LockManager.releaseLock(drive);
     }
 }
 
@@ -100,8 +110,14 @@ export async function uploadUntrackedFiles(context: vscode.ExtensionContext, _si
     if (!workspaceRoot) return;
     const drive = await getAuthenticatedClient(context);
     if (!drive) return;
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+    if (!projectFolderId) return;
+
+    // Acquire Lock (silent background sync)
+    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'Untracked Background Sync', true);
+    if (!lockAcquired) return;
+
     try {
-        const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
         const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot, context);
         const config = await getEffectiveConfig(drive, projectFolderId);
         const allFiles = await getUntrackedAndIgnoredFiles(workspaceRoot);
@@ -119,7 +135,10 @@ export async function uploadUntrackedFiles(context: vscode.ExtensionContext, _si
                 await uploadFile(drive, untrackedFolderId, absPath, relPath, machineId);
             }
         }
-    } catch (e: any) {}
+    } catch (e: any) {
+    } finally {
+        await LockManager.releaseLock(drive);
+    }
 }
 
 export async function deleteUntrackedFile(context: vscode.ExtensionContext) {

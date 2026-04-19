@@ -21,6 +21,7 @@ import {
     updateFile,
     uploadFile
 } from '../googleDrive/operations';
+import { LockManager } from '../googleDrive/lockManager';
 
 export async function trackCurrentConversation(context: vscode.ExtensionContext) {
     const workspaceRoot = getWorkspaceRoot();
@@ -87,6 +88,14 @@ export async function syncAIHistory(context: vscode.ExtensionContext, silent: bo
     }
     const drive = await getAuthenticatedClient(context);
     if (!drive) return;
+
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+    if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
+
+    // Acquire Lock
+    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'AI History Sync', silent);
+    if (!lockAcquired) return;
+
     if (!silent) vscode.window.showInformationMessage('Синхронизация истории AI...');
     try {
         const historyFolderId = await findOrCreateAIHistoryFolder(drive, workspaceRoot, context);
@@ -122,6 +131,8 @@ export async function syncAIHistory(context: vscode.ExtensionContext, silent: bo
         if (!silent) vscode.window.showInformationMessage('Синхронизация истории AI завершена.');
     } catch (error: any) {
         vscode.window.showErrorMessage(`Ошибка синхронизации AI: ${error.message}`);
+    } finally {
+        await LockManager.releaseLock(drive);
     }
 }
 
