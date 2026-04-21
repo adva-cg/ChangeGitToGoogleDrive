@@ -5,12 +5,49 @@ import * as fsSync from 'fs';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 
+export interface GitRepository {
+    root: string;
+    name: string;
+}
+
 export function getWorkspaceRoot(): string | null {
     if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
         return vscode.workspace.workspaceFolders[0].uri.fsPath;
     }
-    vscode.window.showErrorMessage('No workspace folder is open.');
     return null;
+}
+
+export async function getGitRepositories(): Promise<GitRepository[]> {
+    const repos: GitRepository[] = [];
+    
+    const gitExtension = vscode.extensions.getExtension<any>('vscode.git');
+    if (gitExtension) {
+        const api = gitExtension.exports.getAPI(1);
+        if (api && api.repositories) {
+            for (const repo of api.repositories) {
+                const root = repo.rootUri.fsPath;
+                repos.push({
+                    root: root,
+                    name: path.basename(root)
+                });
+            }
+        }
+    }
+
+    if (repos.length === 0 && vscode.workspace.workspaceFolders) {
+        for (const folder of vscode.workspace.workspaceFolders) {
+            const root = folder.uri.fsPath;
+            // Check if it's a git repo folder
+            if (fsSync.existsSync(path.join(root, '.git'))) {
+                repos.push({
+                    root: root,
+                    name: path.basename(root)
+                });
+            }
+        }
+    }
+
+    return repos;
 }
 
 export function runCommand(command: string, cwd: string): Promise<{ stdout: string; stderr: string }> {

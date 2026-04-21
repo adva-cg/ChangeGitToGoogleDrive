@@ -8,7 +8,9 @@ import {
     PROCESSED_TOMBSTONES_KEY 
 } from '../constants';
 import { 
-    getWorkspaceRoot, 
+    getWorkspaceRoot,
+    getGitRepositories,
+    GitRepository,
     runCommand, 
     sanitizeBranchNameForDrive, 
     restoreBranchNameFromDrive 
@@ -30,121 +32,128 @@ import {
     updateRemoteRefs 
 } from './gitUtils';
 
-let lastKnownBranches = new Set<string>();
+export async function initialUpload(context: vscode.ExtensionContext, repo?: GitRepository) {
+    if (!repo) {
+        const repos = await getGitRepositories();
+        for (const r of repos) {
+            await initialUpload(context, r);
+        }
+        return;
+    }
 
-export async function initialUpload(context: vscode.ExtensionContext) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
+    const { root: repoRoot, name: repoName } = repo;
     try {
-        const currentBranch = await getCurrentBranch(workspaceRoot);
+        const currentBranch = await getCurrentBranch(repoRoot);
         if (!currentBranch) return;
         
         const drive = await getAuthenticatedClient(context);
         if (!drive) return;
 
-        const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
-        if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
+        const projectFolderId = await findOrCreateBaseProjectFolder(drive, repoRoot, context);
+        if (!projectFolderId) throw new Error(`Could not find or create project folder for ${repoName} on Google Drive.`);
 
         // Acquire Remote Lock
-        const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'git', 'Git Initial Push', false);
+        const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'git', `Git Initial Push: ${repoName}`, false, repoRoot);
         if (!lockAcquired) return;
 
         try {
             await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`, undefined);
-            vscode.window.showInformationMessage(`Статус синхронизации для ветки '${currentBranch}' сброшен. Начинаю новую выгрузку...`);
+            vscode.window.showInformationMessage(`[${repoName}] Статус синхронизации для ветки '${currentBranch}' сброшен. Начинаю новую выгрузку...`);
             
             const bundleFolderId = await ensureSingleFolder(drive, projectFolderId, 'bundles', context);
-            if (!bundleFolderId) throw new Error('Could not find or create bundles folder.');
+            if (!bundleFolderId) throw new Error(`Could not find or create bundles folder for ${repoName}.`);
             
             const remoteRefs = await getRemoteRefs(drive, bundleFolderId);
-            await pushCommits(context, drive, bundleFolderId, remoteRefs, false);
+            await pushCommits(context, drive, bundleFolderId, remoteRefs, repoRoot, false);
         } finally {
-            await LockManager.releaseLock(drive, 'git');
+            await LockManager.releaseLock(drive, 'git', repoRoot);
         }
     } catch (error: any) {
-        vscode.window.showErrorMessage(`Первоначальная выгрузка не удалась: ${error.message}`);
+        vscode.window.showErrorMessage(`[${repoName}] Первоначальная выгрузка не удалась: ${error.message}`);
     }
 }
 
-export async function sync(context: vscode.ExtensionContext, silent: boolean = false) {
+export async function sync(context: vscode.ExtensionContext, silent: boolean = false, repo?: GitRepository) {
+    if (!repo) {
+        const repos = await getGitRepositories();
+        for (const r of repos) {
+            await sync(context, silent, r);
+        }
+        return;
+    }
+
+    const { root: repoRoot, name: repoName } = repo;
     try {
         const drive = await getAuthenticatedClient(context);
         if (!drive) return;
-        const workspaceRoot = getWorkspaceRoot();
-        if (!workspaceRoot) return;
 
-        const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
-        if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
+        const projectFolderId = await findOrCreateBaseProjectFolder(drive, repoRoot, context);
+        if (!projectFolderId) throw new Error(`Could not find or create project folder for ${repoName} on Google Drive.`);
 
         // Acquire Lock
-        const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'git', 'Git Sync', silent);
+        const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'git', `Git Sync: ${repoName}`, silent, repoRoot);
         if (!lockAcquired) return;
 
         try {
             const bundleFolderId = await ensureSingleFolder(drive, projectFolderId, 'bundles', context);
-            if (!bundleFolderId) throw new Error('Could not find or create bundles folder.');
+            if (!bundleFolderId) throw new Error(`Could not find or create bundles folder for ${repoName}.`);
             
             const remoteRefs = await getRemoteRefs(drive, bundleFolderId);
-            await checkRemoteBranchTombstones(context, drive, silent);
-            await pullCommits(context, drive, bundleFolderId, remoteRefs, silent);
-            await pushCommits(context, drive, bundleFolderId, remoteRefs, silent);
+            await checkRemoteBranchTombstones(context, drive, repoRoot, silent);
+            await pullCommits(context, drive, bundleFolderId, remoteRefs, repoRoot, silent);
+            await pushCommits(context, drive, bundleFolderId, remoteRefs, repoRoot, silent);
 
             // Cleanup SYNC_REQUEST if it exists
-            const syncRequestPath = path.join(workspaceRoot, '.git', 'SYNC_REQUEST');
+            const syncRequestPath = path.join(repoRoot, '.git', 'SYNC_REQUEST');
             if (fsSync.existsSync(syncRequestPath)) {
                 await fs.unlink(syncRequestPath).catch(() => {});
             }
 
-            if (!silent) vscode.window.showInformationMessage('Sync finished.');
+            if (!silent) vscode.window.showInformationMessage(`[${repoName}] Sync finished.`);
         } finally {
-            await LockManager.releaseLock(drive, 'git');
+            await LockManager.releaseLock(drive, 'git', repoRoot);
         }
     } catch (error: any) {
-        const errorMsg = `Sync failed: ${error.message}`;
+        const errorMsg = `[${repoName}] Sync failed: ${error.message}`;
         if (silent) {
             console.error(errorMsg);
-            // Don't show modal error for background sync failures, but maybe a status bar message would be better?
-            // For now keep showErrorMessage but without modal.
-            vscode.window.showErrorMessage(`Background sync failed: ${error.message}.`);
+            vscode.window.showErrorMessage(`Background sync failed for ${repoName}: ${error.message}.`);
         } else {
             vscode.window.showErrorMessage(errorMsg, { modal: true });
         }
     }
 }
 
-// Removed acquireRemoteLock, releaseRemoteLock, startHeartbeat, stopHeartbeat as they are now in LockManager.
-
-async function checkRemoteBranchTombstones(context: vscode.ExtensionContext, drive: drive_v3.Drive, silent: boolean = false) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
+async function checkRemoteBranchTombstones(context: vscode.ExtensionContext, drive: drive_v3.Drive, repoRoot: string, silent: boolean = false) {
     try {
-        const tombstonesFolderId = await findOrCreateTombstonesFolder(drive, workspaceRoot, context);
+        const tombstonesFolderId = await findOrCreateTombstonesFolder(drive, repoRoot, context);
         const branchTombstonesFolderId = await findOrCreateSubFolder(drive, tombstonesFolderId, 'branches', context);
         const { data: { files: tombstones } } = await drive.files.list({
             q: `'${branchTombstonesFolderId}' in parents and trashed=false`,
             fields: 'files(id, name)'
         });
         if (!tombstones || tombstones.length === 0) return;
-        const localBranches = await getLocalBranches(workspaceRoot);
+        const localBranches = await getLocalBranches(repoRoot);
         const processedTombstones = context.workspaceState.get<Record<string, boolean>>(PROCESSED_TOMBSTONES_KEY, {});
         for (const tombstone of tombstones) {
             const branchName = restoreBranchNameFromDrive(tombstone.name || '');
+            const repoName = path.basename(repoRoot);
             if (localBranches.includes(branchName) && tombstone.id && !processedTombstones[tombstone.id]) {
                 const choice = await vscode.window.showWarningMessage(
-                    `Ветка '${branchName}' была удалена на другом компьютере. Удалить её локально?`,
+                    `[${repoName}] Ветка '${branchName}' была удалена на другом компьютере. Удалить её локально?`,
                     'Да', 'Нет'
                 );
                 if (choice === 'Да') {
                     try {
-                        await runCommand(`git branch -D ${branchName}`, workspaceRoot);
-                        if (!silent) vscode.window.showInformationMessage(`Ветка '${branchName}' удалена локально.`);
-                        const current = await getCurrentBranch(workspaceRoot);
+                        await runCommand(`git branch -D ${branchName}`, repoRoot);
+                        if (!silent) vscode.window.showInformationMessage(`[${repoName}] Ветка '${branchName}' удалена локально.`);
+                        const current = await getCurrentBranch(repoRoot);
                         if (current === branchName) {
                             const defaultBranch = localBranches.includes('main') ? 'main' : (localBranches.includes('master') ? 'master' : null);
-                            if (defaultBranch) await runCommand(`git checkout ${defaultBranch}`, workspaceRoot);
+                            if (defaultBranch) await runCommand(`git checkout ${defaultBranch}`, repoRoot);
                         }
                     } catch (e: any) {
-                        vscode.window.showErrorMessage(`Не удалось удалить ветку '${branchName}': ${e.message}`);
+                        vscode.window.showErrorMessage(`[${repoName}] Не удалось удалить ветку '${branchName}': ${e.message}`);
                     }
                 }
                 if (tombstone.id) processedTombstones[tombstone.id] = true;
@@ -156,60 +165,57 @@ async function checkRemoteBranchTombstones(context: vscode.ExtensionContext, dri
     }
 }
 
-async function pushCommits(context: vscode.ExtensionContext, drive: drive_v3.Drive, bundleFolderId: string, remoteRefs: any, silent: boolean = false) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
-    const currentBranch = await getCurrentBranch(workspaceRoot);
+async function pushCommits(context: vscode.ExtensionContext, drive: drive_v3.Drive, bundleFolderId: string, remoteRefs: any, repoRoot: string, silent: boolean = false) {
+    const currentBranch = await getCurrentBranch(repoRoot);
     const remoteBranchHead = remoteRefs[currentBranch];
     const lastPushedHash = remoteBranchHead || context.workspaceState.get(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`);
     let currentHead;
     try {
-        const headRes = await runCommand('git rev-parse HEAD', workspaceRoot);
+        const headRes = await runCommand('git rev-parse HEAD', repoRoot);
         currentHead = headRes.stdout.trim();
     } catch (e) {
-        vscode.window.showWarningMessage('Репозиторий пуст. Сделайте хотя бы один коммит.', { modal: true });
+        if (!silent) vscode.window.showWarningMessage(`Репозиторий ${path.basename(repoRoot)} пуст. Сделайте хотя бы один коммит.`, { modal: true });
         return;
     }
     if (lastPushedHash === currentHead) {
-        if (!silent) vscode.window.showInformationMessage('Already up-to-date.');
+        if (!silent) vscode.window.showInformationMessage(`[${path.basename(repoRoot)}] Already up-to-date.`);
         return;
     }
     if (lastPushedHash) {
         try {
-            await runCommand(`git merge-base --is-ancestor ${lastPushedHash} HEAD`, workspaceRoot);
+            await runCommand(`git merge-base --is-ancestor ${lastPushedHash} HEAD`, repoRoot);
         } catch (error) {
-            vscode.window.showErrorMessage('Push aborted: History has been rewritten.');
+            vscode.window.showErrorMessage(`[${path.basename(repoRoot)}] Push aborted: History has been rewritten.`);
             return;
         }
     }
     const revisionRange = lastPushedHash ? `${lastPushedHash}..HEAD` : 'HEAD';
-    const { stdout: commitsToPush } = await runCommand(`git rev-list ${revisionRange}`, workspaceRoot);
+    const { stdout: commitsToPush } = await runCommand(`git rev-list ${revisionRange}`, repoRoot);
     if (!commitsToPush.trim()) return;
     const sanitizedBranchName = sanitizeBranchNameForDrive(currentBranch);
     const bundleFileName = `${sanitizedBranchName}--${currentHead}.bundle`;
-    const bundlePath = path.join(workspaceRoot, '.git', bundleFileName);
+    const bundlePath = path.join(repoRoot, '.git', bundleFileName);
     try {
-        await runCommand(`git bundle create \"${bundlePath}\" ${revisionRange}`, workspaceRoot);
+        await runCommand(`git bundle create \"${bundlePath}\" ${revisionRange}`, repoRoot);
         const media = { mimeType: 'application/octet-stream', body: fsSync.createReadStream(bundlePath) };
         await drive.files.create({ requestBody: { name: bundleFileName, parents: [bundleFolderId] }, media: media });
         remoteRefs[currentBranch] = currentHead;
         await updateRemoteRefs(drive, bundleFolderId, remoteRefs);
         await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`, currentHead);
     } catch (error: any) {
-        vscode.window.showErrorMessage(`Push failed: ${error.message}`);
+        vscode.window.showErrorMessage(`[${path.basename(repoRoot)}] Push failed: ${error.message}`);
     } finally {
         if (fsSync.existsSync(bundlePath)) await fs.unlink(bundlePath);
     }
 }
 
-async function pullCommits(context: vscode.ExtensionContext, drive: drive_v3.Drive, bundleFolderId: string, remoteRefs: any, silent: boolean = false) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
+async function pullCommits(context: vscode.ExtensionContext, drive: drive_v3.Drive, bundleFolderId: string, remoteRefs: any, repoRoot: string, silent: boolean = false) {
     const q = `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle'`;
     const { data: { files: allRemoteBundles } } = await drive.files.list({ q, fields: 'files(id, name, createdTime)', orderBy: 'createdTime' });
     if (!allRemoteBundles || allRemoteBundles.length === 0) return;
-    const localBranches = new Set(await getLocalBranches(workspaceRoot));
-    const currentBranch = await getCurrentBranch(workspaceRoot);
+    const localBranches = new Set(await getLocalBranches(repoRoot));
+    const currentBranch = await getCurrentBranch(repoRoot);
+    const repoName = path.basename(repoRoot);
     const remoteBundlesByBranch = new Map<string, any[]>();
     for (const bundle of allRemoteBundles) {
         const parts = (bundle.name || '').split('--');
@@ -218,13 +224,13 @@ async function pullCommits(context: vscode.ExtensionContext, drive: drive_v3.Dri
         if (!remoteBundlesByBranch.has(branchName)) remoteBundlesByBranch.set(branchName, []);
         remoteBundlesByBranch.get(branchName)!.push(bundle);
     }
-    const tempDir = path.join(workspaceRoot, '.git', 'gdrive-temp-bundles');
+    const tempDir = path.join(repoRoot, '.git', 'gdrive-temp-bundles');
     await fs.mkdir(tempDir, { recursive: true });
     try {
         for (const [branchName, bundles] of remoteBundlesByBranch.entries()) {
             if (localBranches.has(branchName)) {
                 if (branchName !== currentBranch) continue;
-                const { stdout: currentCommits } = await runCommand(`git rev-list ${branchName}`, workspaceRoot);
+                const { stdout: currentCommits } = await runCommand(`git rev-list ${branchName}`, repoRoot);
                 const commitSet = new Set(currentCommits.trim().split(/\s+/));
                 const newBundles = bundles.filter(b => {
                     const hash = (b.name || '').split('--')[1]?.replace('.bundle', '');
@@ -235,33 +241,33 @@ async function pullCommits(context: vscode.ExtensionContext, drive: drive_v3.Dri
                 for (const bundle of newBundles) {
                     const bPath = path.join(tempDir, bundle.name);
                     await downloadFile(drive, bundle.id, bPath);
-                    await runCommand(`git fetch \"${bPath}\"`, workspaceRoot);
+                    await runCommand(`git fetch \"${bPath}\"`, repoRoot);
                     lastHash = bundle.name.split('--')[1]?.replace('.bundle', '');
                 }
                 try {
-                    await runCommand(`git merge --ff-only FETCH_HEAD`, workspaceRoot);
+                    await runCommand(`git merge --ff-only FETCH_HEAD`, repoRoot);
                 } catch (e) {
                     try {
-                        await runCommand(`git merge --no-edit FETCH_HEAD`, workspaceRoot);
+                        await runCommand(`git merge --no-edit FETCH_HEAD`, repoRoot);
                     } catch (mError) {
-                        if (silent) await runCommand(`git merge --abort`, workspaceRoot).catch(() => {});
+                        if (silent) await runCommand(`git merge --abort`, repoRoot).catch(() => {});
                         throw mError;
                     }
                 }
                 const remoteHead = remoteRefs[branchName] || lastHash;
                 if (remoteHead) await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${branchName}`, remoteHead);
             } else {
-                const choice = await vscode.window.showInformationMessage(`Found new branch '${branchName}'. Create local?`, 'Yes');
+                const choice = await vscode.window.showInformationMessage(`[${repoName}] Found new branch '${branchName}'. Create local?`, 'Yes');
                 if (choice === 'Yes') {
                     let lastHash = '';
                     for (const bundle of bundles) {
                         const bPath = path.join(tempDir, bundle.name);
                         await downloadFile(drive, bundle.id, bPath);
-                        await runCommand(`git fetch \"${bPath}\"`, workspaceRoot);
+                        await runCommand(`git fetch \"${bPath}\"`, repoRoot);
                         lastHash = bundle.name.split('--')[1]?.replace('.bundle', '');
                     }
                     if (lastHash) {
-                        await runCommand(`git checkout -b ${branchName} ${lastHash}`, workspaceRoot);
+                        await runCommand(`git checkout -b ${branchName} ${lastHash}`, repoRoot);
                         await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${branchName}`, lastHash);
                     }
                 }
@@ -272,19 +278,25 @@ async function pullCommits(context: vscode.ExtensionContext, drive: drive_v3.Dri
     }
 }
 
-export async function installGitHooks(_context: vscode.ExtensionContext) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
-    const hooksDir = path.join(workspaceRoot, '.git', 'hooks');
+export async function installGitHooks(_context: vscode.ExtensionContext, repo?: GitRepository) {
+    if (!repo) {
+        const repos = await getGitRepositories();
+        for (const r of repos) {
+            await installGitHooks(_context, r);
+        }
+        return;
+    }
+    const { root: repoRoot, name: repoName } = repo;
+    const hooksDir = path.join(repoRoot, '.git', 'hooks');
     const postCommitHookPath = path.join(hooksDir, 'post-commit');
     const postCommitScript = `#!/bin/sh\n# Hook to trigger VS Code sync after commit\ntouch .git/SYNC_REQUEST\n`;
     try {
         await fs.mkdir(hooksDir, { recursive: true });
         await fs.writeFile(postCommitHookPath, postCommitScript);
         await fs.chmod(postCommitHookPath, '755');
-        vscode.window.showInformationMessage('Successfully installed post-commit hook!');
+        vscode.window.showInformationMessage(`[${repoName}] Successfully installed post-commit hook!`);
     } catch (error: any) {
-        vscode.window.showErrorMessage(`Failed to install git hooks: ${error.message}`);
+        vscode.window.showErrorMessage(`[${repoName}] Failed to install git hooks: ${error.message}`);
     }
 }
 
@@ -334,9 +346,18 @@ export async function cloneFromGoogleDrive(context: vscode.ExtensionContext) {
 }
 
 export async function manageSyncHash(context: vscode.ExtensionContext) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
-    const currentBranch = await getCurrentBranch(workspaceRoot);
+    const repos = await getGitRepositories();
+    if (repos.length === 0) return;
+    
+    let repo = repos[0];
+    if (repos.length > 1) {
+        const selected = await vscode.window.showQuickPick(repos.map(r => ({ label: r.name, repo: r })), { placeHolder: 'Выберите репозиторий для управления хешем' });
+        if (!selected) return;
+        repo = selected.repo;
+    }
+
+    const { root: repoRoot, name: repoName } = repo;
+    const currentBranch = await getCurrentBranch(repoRoot);
     if (!currentBranch) return;
     const hashKey = `${LAST_PUSHED_HASH_KEY_PREFIX}${currentBranch}`;
     const choice = await vscode.window.showQuickPick([
@@ -347,7 +368,7 @@ export async function manageSyncHash(context: vscode.ExtensionContext) {
     if (!choice) return;
     let newHash: string | null | undefined = null;
     if (choice.action === "select") {
-        const { stdout } = await runCommand('git log -10 --pretty=format:"%H|%s"', workspaceRoot);
+        const { stdout } = await runCommand('git log -10 --pretty=format:"%H|%s"', repoRoot);
         const commits = stdout.trim().split('\n').map(line => ({ label: line.split('|')[1], description: line.split('|')[0].substring(0, 7), hash: line.split('|')[0] }));
         newHash = (await vscode.window.showQuickPick(commits))?.hash;
     } else if (choice.action === "manual") {
@@ -359,67 +380,17 @@ export async function manageSyncHash(context: vscode.ExtensionContext) {
     await context.workspaceState.update(hashKey, newHash);
     const drive = await getAuthenticatedClient(context);
     if (drive) {
-        const bundleFolderId = await findOrCreateProjectFolders(drive, workspaceRoot, context);
+        const bundleFolderId = await findOrCreateProjectFolders(drive, repoRoot, context);
         if (bundleFolderId) {
             const remoteRefs = await getRemoteRefs(drive, bundleFolderId);
             if (newHash === undefined) delete remoteRefs[currentBranch]; else remoteRefs[currentBranch] = newHash;
             await updateRemoteRefs(drive, bundleFolderId, remoteRefs);
+            vscode.window.showInformationMessage(`[${repoName}] Хеш синхронизации обновлен.`);
         }
     }
 }
 
-export async function setupBranchMonitoring(context: vscode.ExtensionContext) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
-    try {
-        const branches = await getLocalBranches(workspaceRoot);
-        lastKnownBranches = new Set(branches);
-    } catch (e) {}
-    const gitExtension = vscode.extensions.getExtension('vscode.git');
-    if (gitExtension) {
-        const api = gitExtension.exports.getAPI(1);
-        api.onDidOpenRepository((repo: any) => repo.state.onDidChange(() => checkForBranchChanges(context)));
-        api.repositories.forEach((repo: any) => repo.state.onDidChange(() => checkForBranchChanges(context)));
-    } else {
-        setInterval(() => checkForBranchChanges(context), 30000);
-    }
+export async function setupBranchMonitoring(_context: vscode.ExtensionContext) {
+    // Branch monitoring is temporarily disabled for multi-repo refactoring
 }
 
-async function checkForBranchChanges(context: vscode.ExtensionContext) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
-    try {
-        const currentBranches = await getLocalBranches(workspaceRoot);
-        const currentBranchesSet = new Set(currentBranches);
-        for (const branch of Array.from(lastKnownBranches)) {
-            if (!currentBranchesSet.has(branch)) await offerToDeleteBranchFromDrive(context, branch);
-        }
-        lastKnownBranches = currentBranchesSet;
-    } catch (e) {}
-}
-
-async function offerToDeleteBranchFromDrive(context: vscode.ExtensionContext, branchName: string) {
-    const choice = await vscode.window.showInformationMessage(`Ветка '${branchName}' была удалена. Удалить её из Drive?`, 'Да', 'Нет');
-    if (choice === 'Да') await deleteBranchFromDrive(context, branchName);
-}
-
-async function deleteBranchFromDrive(context: vscode.ExtensionContext, branchName: string) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
-    const drive = await getAuthenticatedClient(context);
-    if (!drive) return;
-    try {
-        const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
-        const bundleFolderId = await ensureSingleFolder(drive, projectFolderId, 'bundles', context);
-        const sanitizedName = sanitizeBranchNameForDrive(branchName);
-        const q = `'${bundleFolderId}' in parents and name contains '${sanitizedName}--' and trashed=false`;
-        const res = await drive.files.list({ q, fields: 'files(id, name)' });
-        for (const file of res.data.files || []) {
-            if (file.id && file.name?.startsWith(`${sanitizedName}--`)) await drive.files.update({ fileId: file.id, requestBody: { trashed: true } });
-        }
-        const tombstonesFolderId = await ensureSingleFolder(drive, projectFolderId, 'tombstones', context);
-        const branchTombstonesFolderId = await ensureSingleFolder(drive, tombstonesFolderId, 'branches', context);
-        await drive.files.create({ requestBody: { name: sanitizedName, parents: [branchTombstonesFolderId], mimeType: 'text/plain' }, media: { mimeType: 'text/plain', body: `Deleted at ${new Date().toISOString()}` } });
-        await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${branchName}`, undefined);
-    } catch (error: any) {}
-}

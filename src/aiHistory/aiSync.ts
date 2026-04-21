@@ -12,10 +12,9 @@ import {
     ANTIGRAVITY_IMPLICIT_PATH,
     ANTIGRAVITY_KNOWLEDGE_PATH 
 } from '../constants';
-import { getWorkspaceRoot, getFileMd5 } from '../utils/common';
+import { getFileMd5 } from '../utils/common';
 import { getAuthenticatedClient } from '../googleDrive/auth';
 import { 
-    findOrCreateBaseProjectFolder, 
     ensureSingleFolder,
     findOrCreateSubFolder,
     getBulkRemoteStructure,
@@ -26,15 +25,13 @@ import {
 import { LockManager } from '../googleDrive/lockManager';
 
 export async function trackCurrentConversation(context: vscode.ExtensionContext) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
     try {
         const conversationId = await getCurrentConversationId();
         if (!conversationId) return;
-        let projectConversationIds = context.workspaceState.get<string[]>(ANTIGRAVITY_IDS_KEY, []);
-        if (!projectConversationIds.includes(conversationId)) {
-            const updatedIds = [...projectConversationIds, conversationId];
-            await context.workspaceState.update(ANTIGRAVITY_IDS_KEY, updatedIds);
+        let globalConversationIds = context.globalState.get<string[]>(ANTIGRAVITY_IDS_KEY, []);
+        if (!globalConversationIds.includes(conversationId)) {
+            const updatedIds = [...globalConversationIds, conversationId];
+            await context.globalState.update(ANTIGRAVITY_IDS_KEY, updatedIds);
         }
     } catch (e) {
         console.error('Error tracking current conversation:', e);
@@ -64,39 +61,38 @@ export async function configureAntigravitySync(context: vscode.ExtensionContext)
     if (!choice) return;
     switch (choice.action) {
         case "enable":
-            await context.workspaceState.update(ANTIGRAVITY_ENABLED_KEY, true);
-            vscode.window.showInformationMessage('Antigravity Sync включена.');
+            await context.globalState.update(ANTIGRAVITY_ENABLED_KEY, true);
+            vscode.window.showInformationMessage('Antigravity Sync включена глобально.');
             await syncAntigravity(context, false);
             break;
         case "disable":
-            await context.workspaceState.update(ANTIGRAVITY_ENABLED_KEY, false);
-            vscode.window.showInformationMessage('Antigravity Sync отключена.');
+            await context.globalState.update(ANTIGRAVITY_ENABLED_KEY, false);
+            vscode.window.showInformationMessage('Antigravity Sync отключена глобально.');
             break;
         case "reset":
-            await context.workspaceState.update(ANTIGRAVITY_ENABLED_KEY, undefined);
+            await context.globalState.update(ANTIGRAVITY_ENABLED_KEY, undefined);
             vscode.window.showInformationMessage('Выбор сброшен.');
             break;
     }
 }
 
 export async function syncAntigravity(context: vscode.ExtensionContext, silent: boolean = false) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
-    let isEnabled = context.workspaceState.get(ANTIGRAVITY_ENABLED_KEY);
+    let isEnabled = context.globalState.get(ANTIGRAVITY_ENABLED_KEY);
     if (isEnabled === false) return;
     if (isEnabled === undefined) {
-        const choice = await vscode.window.showInformationMessage('Включить Antigravity Sync?', 'Да', 'Нет');
-        if (choice === 'Да') { isEnabled = true; await context.workspaceState.update(ANTIGRAVITY_ENABLED_KEY, true); }
-        else { isEnabled = false; await context.workspaceState.update(ANTIGRAVITY_ENABLED_KEY, false); return; }
+        const choice = await vscode.window.showInformationMessage('Включить Antigravity Sync? (История бесед будет общей для всех проектов)', 'Да', 'Нет');
+        if (choice === 'Да') { isEnabled = true; await context.globalState.update(ANTIGRAVITY_ENABLED_KEY, true); }
+        else { isEnabled = false; await context.globalState.update(ANTIGRAVITY_ENABLED_KEY, false); return; }
     }
     const drive = await getAuthenticatedClient(context);
     if (!drive) return;
 
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
-    if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
+    // Use a global folder ID for locking AG history
+    const globalRootFolderId = await ensureSingleFolder(drive, null, '.gdrive-git', context);
+    if (!globalRootFolderId) throw new Error('Could not find or create .gdrive-git folder.');
 
-    // Acquire Lock
-    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'antigravity', 'Antigravity Sync', silent);
+    // Acquire Lock on global folder
+    const lockAcquired = await LockManager.acquireLock(drive, globalRootFolderId, 'antigravity', 'Global Antigravity Sync', silent);
     if (!lockAcquired) return;
 
     try {
@@ -106,10 +102,9 @@ export async function syncAntigravity(context: vscode.ExtensionContext, silent: 
             cancellable: false
         }, async (progress) => {
             progress.report({ message: "Получение структуры облака..." });
-            const historyFolderId = await findOrCreateAntigravityFolder(drive, workspaceRoot, context);
-            const knowledgeFolderId = await findOrCreateAntigravityKnowledgeFolder(drive, workspaceRoot, context);
+            const historyFolderId = await findOrCreateAntigravityFolder(drive, context);
+            const knowledgeFolderId = await findOrCreateAntigravityKnowledgeFolder(drive, context);
             
-            // Включаем параллельное получение структур для ускорения
             const [remoteManifestId, remoteHistoryStructure, remoteKnowledgeStructure] = await Promise.all([
                 findOrCreateAntigravityManifest(drive, historyFolderId),
                 getBulkRemoteStructure(drive, historyFolderId),
@@ -119,8 +114,10 @@ export async function syncAntigravity(context: vscode.ExtensionContext, silent: 
             if (!remoteManifestId) return;
             const { data: manifestContent }: any = await drive.files.get({ fileId: remoteManifestId, alt: 'media' });
             let remoteManifest: any = typeof manifestContent === 'object' ? manifestContent : JSON.parse(manifestContent || '{}');
-            const projectConversationIds = context.workspaceState.get<string[]>(ANTIGRAVITY_IDS_KEY, []);
-            const allRelevantIds = Array.from(new Set([...projectConversationIds, ...(remoteManifest.ids || [])]));
+            
+            // Sync ALL folders found in local path + manifest IDs
+            const localFolders = await fs.readdir(ANTIGRAVITY_BRAIN_PATH).catch(() => []);
+            const allRelevantIds = Array.from(new Set([...localFolders, ...(remoteManifest.ids || [])])).filter(id => id.length > 20);
             const machineId = vscode.env.machineId;
 
             const total = allRelevantIds.length;
@@ -193,7 +190,7 @@ export async function syncAntigravity(context: vscode.ExtensionContext, silent: 
             await syncFolderBulk(drive, ANTIGRAVITY_KNOWLEDGE_PATH, knowledgeFolderId, remoteKnowledgeStructure, machineId, silent);
 
             const mergedIds = allRelevantIds;
-            await context.workspaceState.update(ANTIGRAVITY_IDS_KEY, mergedIds);
+            await context.globalState.update(ANTIGRAVITY_IDS_KEY, mergedIds);
             await drive.files.update({ 
                 fileId: remoteManifestId, 
                 media: { mimeType: 'application/json', body: JSON.stringify({ ids: mergedIds }) } 
@@ -274,9 +271,9 @@ async function syncFileWithConflictResolution(drive: drive_v3.Drive, localPath: 
     }
 }
 
-async function findOrCreateAntigravityFolder(drive: drive_v3.Drive, workspaceRoot: string, context: vscode.ExtensionContext) {
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
-    return await ensureSingleFolder(drive, projectFolderId, 'antigravity-history', context);
+async function findOrCreateAntigravityFolder(drive: drive_v3.Drive, context: vscode.ExtensionContext) {
+    const rootFolderId = await ensureSingleFolder(drive, null, '.gdrive-git', context);
+    return await ensureSingleFolder(drive, rootFolderId, 'antigravity-history', context);
 }
 
 async function findOrCreateAntigravityManifest(drive: drive_v3.Drive, historyFolderId: string) {
@@ -292,7 +289,7 @@ async function findOrCreateAntigravityManifest(drive: drive_v3.Drive, historyFol
     return data.id;
 }
 
-async function findOrCreateAntigravityKnowledgeFolder(drive: drive_v3.Drive, workspaceRoot: string, context: vscode.ExtensionContext) {
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
-    return await ensureSingleFolder(drive, projectFolderId, 'antigravity-knowledge', context);
+async function findOrCreateAntigravityKnowledgeFolder(drive: drive_v3.Drive, context: vscode.ExtensionContext) {
+    const rootFolderId = await ensureSingleFolder(drive, null, '.gdrive-git', context);
+    return await ensureSingleFolder(drive, rootFolderId, 'antigravity-knowledge', context);
 }

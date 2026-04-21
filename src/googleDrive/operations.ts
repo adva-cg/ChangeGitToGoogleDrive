@@ -4,7 +4,7 @@ import * as fsSync from 'fs';
 import { promises as fs } from 'fs';
 import { drive_v3 } from 'googleapis';
 import { BACKUPS_DIR_NAME } from '../constants';
-import { getWorkspaceRoot, escapeGdriveQueryParam } from '../utils/common';
+import { escapeGdriveQueryParam } from '../utils/common';
 
 export async function downloadFile(drive: drive_v3.Drive, fileId: string, destPath: string) {
     const destDir = path.dirname(destPath);
@@ -91,6 +91,9 @@ export async function ensureSingleFolder(drive: drive_v3.Drive, parentId: string
     } else if (files.length === 1) {
         return files[0].id;
     } else {
+        // Find repoRoot from parentId or context if possible, but let's just use the current project folder name if we can.
+        // Actually, for reconciliation we need a place for backups.
+        // If we don't have repoRoot, we use path.basename(firstFolder) as a hint or just skip backups.
         return await reconcileFolderDuplicates(drive, files, folderName, parentId, context as vscode.ExtensionContext);
     }
 }
@@ -100,10 +103,9 @@ export async function reconcileFolderDuplicates(drive: drive_v3.Drive, folders: 
     folders.sort((a, b) => new Date(a.createdTime).getTime() - new Date(b.createdTime).getTime());
     const primaryFolder = folders[0];
     const duplicates = folders.slice(1);
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return undefined;
 
-    const backupBaseId = await findOrCreateBackupsFolder(drive, workspaceRoot, context);
+    const rootFolderId = await ensureSingleFolder(drive, null, '.gdrive-git', context);
+    const backupBaseId = await ensureSingleFolder(drive, rootFolderId, '.backups', context);
     if (!backupBaseId) throw new Error('Could not find or create backups folder');
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const backupSessionId = await ensureSingleFolder(drive, (backupBaseId as string | null), `merge_${folderName}_${timestamp}`, context) as string;
@@ -153,9 +155,9 @@ export async function mergeFoldersRecursive(drive: drive_v3.Drive, targetFolderI
     }
 }
 
-export async function cleanupOldBackups(drive: drive_v3.Drive, workspaceRoot: string) {
+export async function cleanupOldBackups(drive: drive_v3.Drive, repoRoot: string) {
     try {
-        const backupsFolderId = await findOrCreateBackupsFolder(drive, workspaceRoot);
+        const backupsFolderId = await findOrCreateBackupsFolder(drive, repoRoot);
         if (!backupsFolderId) return;
         const res = await drive.files.list({ q: `'${backupsFolderId}' in parents and trashed=false`, fields: 'files(id, name, createdTime)' });
         const sessions = res.data.files || [];
@@ -174,8 +176,8 @@ export async function cleanupOldBackups(drive: drive_v3.Drive, workspaceRoot: st
     }
 }
 
-export async function findOrCreateBaseProjectFolder(drive: drive_v3.Drive, workspaceRoot: string, context?: vscode.ExtensionContext) {
-    const projectName = path.basename(workspaceRoot);
+export async function findOrCreateBaseProjectFolder(drive: drive_v3.Drive, repoRoot: string, context?: vscode.ExtensionContext) {
+    const projectName = path.basename(repoRoot);
     const rootFolderId = await ensureSingleFolder(drive, null, '.gdrive-git', context);
     return await ensureSingleFolder(drive, rootFolderId, projectName, context);
 }
@@ -184,23 +186,23 @@ export async function findOrCreateSubFolder(drive: drive_v3.Drive, parentId: str
     return await ensureSingleFolder(drive, parentId, folderName, context);
 }
 
-export async function findOrCreateProjectFolders(drive: drive_v3.Drive, workspaceRoot: string, context: vscode.ExtensionContext) {
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+export async function findOrCreateProjectFolders(drive: drive_v3.Drive, repoRoot: string, context: vscode.ExtensionContext) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, repoRoot, context);
     return await ensureSingleFolder(drive, projectFolderId, 'bundles', context);
 }
 
-export async function findOrCreateUntrackedFilesFolder(drive: drive_v3.Drive, workspaceRoot: string, context: vscode.ExtensionContext) {
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+export async function findOrCreateUntrackedFilesFolder(drive: drive_v3.Drive, repoRoot: string, context: vscode.ExtensionContext) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, repoRoot, context);
     return await ensureSingleFolder(drive, projectFolderId, 'untracked', context);
 }
 
-export async function findOrCreateTombstonesFolder(drive: drive_v3.Drive, workspaceRoot: string, context: vscode.ExtensionContext) {
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+export async function findOrCreateTombstonesFolder(drive: drive_v3.Drive, repoRoot: string, context: vscode.ExtensionContext) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, repoRoot, context);
     return await ensureSingleFolder(drive, projectFolderId, 'tombstones', context);
 }
 
-export async function findOrCreateBackupsFolder(drive: drive_v3.Drive, workspaceRoot: string, context?: vscode.ExtensionContext) {
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+export async function findOrCreateBackupsFolder(drive: drive_v3.Drive, repoRoot: string, context?: vscode.ExtensionContext) {
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, repoRoot, context);
     const q = `name='${BACKUPS_DIR_NAME}' and mimeType='application/vnd.google-apps.folder' and '${projectFolderId}' in parents and trashed=false`;
     const res = await drive.files.list({ q, fields: 'files(id)' });
     const files = res.data.files || [];

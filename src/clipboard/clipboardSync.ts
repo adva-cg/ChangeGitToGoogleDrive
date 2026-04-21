@@ -5,7 +5,7 @@ import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { CLIPBOARD_SYNC_FILE_NAME, LAST_CLIPBOARD_HASH_KEY } from '../constants';
-import { getWorkspaceRoot, runCommand } from '../utils/common';
+import { runCommand } from '../utils/common';
 import { getAuthenticatedClient } from '../googleDrive/auth';
 import { ensureSingleFolder } from '../googleDrive/operations';
 
@@ -84,12 +84,11 @@ async function findClipboardSyncFile(drive: drive_v3.Drive, parentId: string) {
 }
 
 async function getLocalClipboard() {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return null;
+    const cwd = os.tmpdir();
     try {
-        const isImage = (await runCommand('powershell -noprofile -command "Add-Type -AssemblyName System.Windows.Forms; [Windows.Forms.Clipboard]::ContainsImage()"', workspaceRoot)).stdout.trim() === 'True';
+        const isImage = (await runCommand('powershell -noprofile -command "Add-Type -AssemblyName System.Windows.Forms; [Windows.Forms.Clipboard]::ContainsImage()"', cwd)).stdout.trim() === 'True';
         if (isImage) {
-            const base64 = (await runCommand('powershell -noprofile -command "Add-Type -AssemblyName System.Windows.Forms; $img = [Windows.Forms.Clipboard]::GetImage(); if ($img) { $ms = New-Object System.IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [Convert]::ToBase64String($ms.ToArray()) }"', workspaceRoot)).stdout.trim();
+            const base64 = (await runCommand('powershell -noprofile -command "Add-Type -AssemblyName System.Windows.Forms; $img = [Windows.Forms.Clipboard]::GetImage(); if ($img) { $ms = New-Object System.IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [Convert]::ToBase64String($ms.ToArray()) }"', cwd)).stdout.trim();
             if (base64) return { type: 'image', data: base64, hash: crypto.createHash('md5').update(base64).digest('hex') };
         }
     } catch (e) {}
@@ -105,7 +104,7 @@ async function setLocalClipboard(type: string, data: string) {
             const tempFile = path.join(os.tmpdir(), `cv_temp_${Date.now()}.b64`);
             await fs.writeFile(tempFile, data);
             const psCommand = `powershell -noprofile -command "Add-Type -AssemblyName System.Windows.Forms; $b64 = Get-Content '${tempFile}' -Raw; [Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromStream((New-Object System.IO.MemoryStream([Convert]::FromBase64String($b64)))))"`;
-            await runCommand(psCommand, getWorkspaceRoot() || '');
+            await runCommand(psCommand, os.tmpdir());
             await fs.unlink(tempFile);
         } catch (e) {}
     }

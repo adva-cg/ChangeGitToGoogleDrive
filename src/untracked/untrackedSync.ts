@@ -5,7 +5,8 @@ import * as fsSync from 'fs';
 import { minimatch } from 'minimatch';
 import { CONFLICT_DECISIONS_KEY, LAST_KNOWN_UNTRACKED_FILES_KEY } from '../constants';
 import { 
-    getWorkspaceRoot, 
+    getGitRepositories,
+    GitRepository,
     runCommand, 
     getFileMd5, 
     getFilesRecursively 
@@ -29,33 +30,40 @@ import {
     updateCloudConfig 
 } from './decisions';
 
-export async function syncUntrackedFiles(context: vscode.ExtensionContext, silent: boolean = false) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
+export async function syncUntrackedFiles(context: vscode.ExtensionContext, silent: boolean = false, repo?: GitRepository) {
+    if (!repo) {
+        const repos = await getGitRepositories();
+        for (const r of repos) {
+            await syncUntrackedFiles(context, silent, r);
+        }
+        return;
+    }
+
+    const { root: repoRoot, name: repoName } = repo;
     const drive = await getAuthenticatedClient(context);
     if (!drive) return;
 
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
-    if (!projectFolderId) throw new Error('Could not find or create project folder on Google Drive.');
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, repoRoot, context);
+    if (!projectFolderId) throw new Error(`Could not find or create project folder for ${repoName} on Google Drive.`);
 
     // Acquire Lock
-    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'untracked', 'Untracked Sync', silent);
+    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'untracked', `Untracked Sync: ${repoName}`, silent, repoRoot);
     if (!lockAcquired) return;
 
-    if (!silent) vscode.window.showInformationMessage('Синхронизация неотслеживаемых файлов...');
+    if (!silent) vscode.window.showInformationMessage(`[${repoName}] Синхронизация неотслеживаемых файлов...`);
     try {
-        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot, context);
+        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, repoRoot, context);
         const deletedFolderId = await ensureSingleFolder(drive, untrackedFolderId, '.deleted', context);
         const tombstones = await getAllRemoteFiles(drive, deletedFolderId, true);
         const tombstoneSet = new Set(tombstones.map(f => f.name));
         const decisions = getConflictDecisions(context);
         let config = await getEffectiveConfig(drive, projectFolderId);
-        const localFiles = await getUntrackedAndIgnoredFiles(workspaceRoot);
+        const localFiles = await getUntrackedAndIgnoredFiles(repoRoot);
         const remoteFiles = await getAllRemoteFiles(drive, untrackedFolderId);
         const machineId = vscode.env.machineId;
 
         // Detect manual local deletions
-        const lastKnownFiles: string[] = context.workspaceState.get(LAST_KNOWN_UNTRACKED_FILES_KEY, []);
+        const lastKnownFiles: string[] = context.workspaceState.get(`${LAST_KNOWN_UNTRACKED_FILES_KEY}_${repoName}`, []);
         const lastKnownFilesSet = new Set(lastKnownFiles);
         const currentFilesSet = new Set(localFiles);
         const remoteFilesMap = new Map(remoteFiles.map(f => [f.name, f]));
@@ -71,7 +79,7 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
 
         if (disappearedFiles.length > 0) {
             const choice = await vscode.window.showWarningMessage(
-                `Detected ${disappearedFiles.length} locally deleted files. Mark them as deleted on Google Drive too?`,
+                `[${repoName}] Detected ${disappearedFiles.length} locally deleted files. Mark them as deleted on Google Drive too?`,
                 'Yes', 'No'
             );
             if (choice === 'Yes') {
@@ -91,11 +99,11 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
         }
 
         for (const remoteFile of remoteFiles) {
-            const localPath = path.join(workspaceRoot, remoteFile.name);
+            const localPath = path.join(repoRoot, remoteFile.name);
             if (!fsSync.existsSync(localPath) && !isFileIncluded(remoteFile.name, config.include, config.exclude)) {
-                const decisionKey = `suggest_track_${remoteFile.name}`;
+                const decisionKey = `suggest_track_${repoName}_${remoteFile.name}`;
                 if (decisions[decisionKey]) continue;
-                const choice = await vscode.window.showInformationMessage(`Found new file on Drive: "${remoteFile.name}". Track it?`, 'Yes', 'No', 'Never');
+                const choice = await vscode.window.showInformationMessage(`[${repoName}] Found new file on Drive: "${remoteFile.name}". Track it?`, 'Yes', 'No', 'Never');
                 if (choice === 'Yes') {
                     config.include.push(remoteFile.name);
                     await updateCloudConfig(drive, projectFolderId, config);
@@ -106,21 +114,21 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
         }
 
         for (const tombstonePath of tombstoneSet) {
-            const localPath = path.join(workspaceRoot, tombstonePath);
+            const localPath = path.join(repoRoot, tombstonePath);
             if (fsSync.existsSync(localPath)) {
-                const choice = await vscode.window.showWarningMessage(`File "${tombstonePath}" was deleted elsewhere. Delete local?`, 'Yes', 'No');
+                const choice = await vscode.window.showWarningMessage(`[${repoName}] File "${tombstonePath}" was deleted elsewhere. Delete local?`, 'Yes', 'No');
                 if (choice === 'Yes') await fs.unlink(localPath);
             }
         }
 
         for (const remoteFile of remoteFiles) {
             if (tombstoneSet.has(remoteFile.name) || !isFileIncluded(remoteFile.name, config.include, config.exclude)) continue;
-            const localPath = path.join(workspaceRoot, remoteFile.name);
+            const localPath = path.join(repoRoot, remoteFile.name);
             if (fsSync.existsSync(localPath)) {
                 const localMd5 = await getFileMd5(localPath);
                 if (localMd5 !== remoteFile.md5Checksum) {
                     if (remoteFile.appProperties?.machineId === machineId) continue;
-                    const choice = await vscode.window.showQuickPick(['Download', 'Upload', 'Skip'], { placeHolder: `Conflict: ${remoteFile.name}` });
+                    const choice = await vscode.window.showQuickPick(['Download', 'Upload', 'Skip'], { placeHolder: `Conflict [${repoName}]: ${remoteFile.name}` });
                     if (choice === 'Download' && remoteFile.id) await downloadFile(drive, remoteFile.id, localPath);
                     else if (choice === 'Upload' && remoteFile.id) await updateFile(drive, remoteFile.id, localPath, machineId);
                 }
@@ -132,38 +140,45 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
         const remoteFileNames = new Set(remoteFiles.map(f => f.name));
         for (const relPath of localFiles) {
             if (remoteFileNames.has(relPath) || tombstoneSet.has(relPath) || !isFileIncluded(relPath, config.include, config.exclude)) continue;
-            await uploadFile(drive, untrackedFolderId, path.join(workspaceRoot, relPath), relPath, machineId);
+            await uploadFile(drive, untrackedFolderId, path.join(repoRoot, relPath), relPath, machineId);
         }
 
         // Update last known state
-        await context.workspaceState.update(LAST_KNOWN_UNTRACKED_FILES_KEY, localFiles);
+        await context.workspaceState.update(`${LAST_KNOWN_UNTRACKED_FILES_KEY}_${repoName}`, localFiles);
     } catch (e: any) {
-        vscode.window.showErrorMessage(`Sync failed: ${e.message}`);
+        vscode.window.showErrorMessage(`[${repoName}] Sync failed: ${e.message}`);
     } finally {
-        await LockManager.releaseLock(drive, 'untracked');
+        await LockManager.releaseLock(drive, 'untracked', repoRoot);
     }
 }
 
-export async function uploadUntrackedFiles(context: vscode.ExtensionContext, _silent: boolean = false) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
+export async function uploadUntrackedFiles(context: vscode.ExtensionContext, silent: boolean = false, repo?: GitRepository) {
+    if (!repo) {
+        const repos = await getGitRepositories();
+        for (const r of repos) {
+            await uploadUntrackedFiles(context, silent, r);
+        }
+        return;
+    }
+
+    const { root: repoRoot, name: repoName } = repo;
     const drive = await getAuthenticatedClient(context);
     if (!drive) return;
-    const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
+    const projectFolderId = await findOrCreateBaseProjectFolder(drive, repoRoot, context);
     if (!projectFolderId) return;
 
     // Acquire Lock (silent background sync)
-    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'untracked', 'Untracked Background Sync', true);
+    const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'untracked', `Untracked Background Sync: ${repoName}`, true, repoRoot);
     if (!lockAcquired) return;
 
     try {
-        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot, context);
+        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, repoRoot, context);
         const config = await getEffectiveConfig(drive, projectFolderId);
-        const allFiles = await getUntrackedAndIgnoredFiles(workspaceRoot);
+        const allFiles = await getUntrackedAndIgnoredFiles(repoRoot);
         const toUpload = allFiles.filter(f => isFileIncluded(f, config.include, config.exclude));
         const machineId = vscode.env.machineId;
         for (const relPath of toUpload) {
-            const absPath = path.join(workspaceRoot, relPath);
+            const absPath = path.join(repoRoot, relPath);
             const remoteFile = await findRemoteFile(drive, untrackedFolderId, relPath);
             if (remoteFile) {
                 const localMd5 = await getFileMd5(absPath);
@@ -176,24 +191,33 @@ export async function uploadUntrackedFiles(context: vscode.ExtensionContext, _si
         }
     } catch (e: any) {
     } finally {
-        await LockManager.releaseLock(drive, 'untracked');
+        await LockManager.releaseLock(drive, 'untracked', repoRoot);
     }
 }
 
 export async function deleteUntrackedFile(context: vscode.ExtensionContext) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
+    const repos = await getGitRepositories();
+    if (repos.length === 0) return;
+    
+    let repo = repos[0];
+    if (repos.length > 1) {
+        const selected = await vscode.window.showQuickPick(repos.map(r => ({ label: r.name, repo: r })), { placeHolder: 'Выберите репозиторий' });
+        if (!selected) return;
+        repo = selected.repo;
+    }
+
+    const { root: repoRoot, name: repoName } = repo;
     const drive = await getAuthenticatedClient(context);
     if (!drive) return;
     try {
-        const projectFolderId = await findOrCreateBaseProjectFolder(drive, workspaceRoot, context);
-        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot, context);
+        const projectFolderId = await findOrCreateBaseProjectFolder(drive, repoRoot, context);
+        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, repoRoot, context);
         const config = await getEffectiveConfig(drive, projectFolderId);
-        const localFiles = await getUntrackedAndIgnoredFiles(workspaceRoot);
+        const localFiles = await getUntrackedAndIgnoredFiles(repoRoot);
         const filesToList = localFiles.filter(f => isFileIncluded(f, config.include, config.exclude));
         const selected = await vscode.window.showQuickPick(filesToList, { canPickMany: true });
         if (!selected?.length) return;
-        const choices = await vscode.window.showWarningMessage(`Delete ${selected.length} files?`, 'Yes');
+        const choices = await vscode.window.showWarningMessage(`[${repoName}] Delete ${selected.length} files?`, 'Yes');
         if (choices !== 'Yes') return;
         const deletedFolderId = await ensureSingleFolder(drive, untrackedFolderId, '.deleted', context);
         if (!deletedFolderId) return;
@@ -203,22 +227,31 @@ export async function deleteUntrackedFile(context: vscode.ExtensionContext) {
                 const { data: { parents } } = await drive.files.get({ fileId: remote.id, fields: 'parents' });
                 if (parents?.length && parents[0]) await drive.files.update({ fileId: remote.id, addParents: deletedFolderId, removeParents: parents[0] });
             }
-            await fs.unlink(path.join(workspaceRoot, file));
+            await fs.unlink(path.join(repoRoot, file));
         }
     } catch (e: any) {}
 }
 
 export async function clearTombstones(context: vscode.ExtensionContext) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) return;
+    const repos = await getGitRepositories();
+    if (repos.length === 0) return;
+    
+    let repo = repos[0];
+    if (repos.length > 1) {
+        const selected = await vscode.window.showQuickPick(repos.map(r => ({ label: r.name, repo: r })), { placeHolder: 'Выберите репозиторий для очистки корзины' });
+        if (!selected) return;
+        repo = selected.repo;
+    }
+
+    const { root: repoRoot, name: repoName } = repo;
     const drive = await getAuthenticatedClient(context);
     if (!drive) return;
     try {
-        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, workspaceRoot, context);
+        const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, repoRoot, context);
         const deletedFolderId = await ensureSingleFolder(drive, untrackedFolderId, '.deleted', context);
         const tombstones = await getAllRemoteFiles(drive, deletedFolderId, true);
         if (!tombstones.length) return;
-        const choice = await vscode.window.showWarningMessage(`Clear ${tombstones.length} files from trash?`, 'Yes');
+        const choice = await vscode.window.showWarningMessage(`[${repoName}] Clear ${tombstones.length} files from trash?`, 'Yes');
         if (choice === 'Yes') {
             for (const t of tombstones) if (t.id) await drive.files.delete({ fileId: t.id });
             await context.workspaceState.update(CONFLICT_DECISIONS_KEY, {});

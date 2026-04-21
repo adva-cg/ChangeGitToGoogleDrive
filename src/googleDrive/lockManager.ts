@@ -9,7 +9,7 @@ import {
     updateRemoteLock, 
     deleteRemoteLock 
 } from './operations';
-import { getWorkspaceRoot } from '../utils/common';
+
 
 const LOCK_STALE_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -20,15 +20,18 @@ export class LockManager {
     private static heartbeatIntervals = new Map<string, NodeJS.Timeout>();
     private static sessionId = `${vscode.env.machineId}-${process.pid}`;
 
-    private static getLocalLockPath(category: string): string | null {
-        const root = getWorkspaceRoot();
-        if (!root) return null;
+    private static getLocalLockPath(category: string, repoRoot?: string): string | null {
         const fileName = `.${category}.sync.lock.local`;
-        return path.join(root, '.git', fileName);
+        if (repoRoot) {
+            return path.join(repoRoot, '.git', fileName);
+        } else {
+            // Global lock for things like Antigravity sync
+            return path.join(os.homedir(), '.vscode-gdrive-git', fileName);
+        }
     }
 
-    private static acquireLocalLock(category: string): boolean {
-        const lockPath = this.getLocalLockPath(category);
+    private static acquireLocalLock(category: string, repoRoot?: string): boolean {
+        const lockPath = this.getLocalLockPath(category, repoRoot);
         if (!lockPath) return false;
 
         if (fs.existsSync(lockPath)) {
@@ -60,8 +63,9 @@ export class LockManager {
         }
     }
 
-    private static releaseLocalLock(category: string) {
-        const lockPath = this.getLocalLockPath(category);
+    private static releaseLocalLock(category: string, repoRoot?: string) {
+        if (!repoRoot) return;
+        const lockPath = this.getLocalLockPath(category, repoRoot);
         if (lockPath && fs.existsSync(lockPath)) {
             try {
                 fs.unlinkSync(lockPath);
@@ -69,13 +73,13 @@ export class LockManager {
         }
     }
 
-    static async acquireLock(drive: drive_v3.Drive, projectFolderId: string, category: string, componentName: string, silent: boolean): Promise<boolean> {
+    static async acquireLock(drive: drive_v3.Drive, projectFolderId: string, category: string, componentName: string, silent: boolean, repoRoot?: string): Promise<boolean> {
         if (this.activeLocks.has(category)) {
             if (!silent) vscode.window.showWarningMessage(`Синхронизация ${componentName} уже запущена в этом окне.`);
             return false;
         }
 
-        if (!this.acquireLocalLock(category)) {
+        if (repoRoot && !this.acquireLocalLock(category, repoRoot)) {
             const msg = `Синхронизация ${componentName} заблокирована другим процессом на этой машине.`;
             if (!silent) vscode.window.showWarningMessage(msg);
             return false;
@@ -101,7 +105,7 @@ export class LockManager {
             if (now - lastUpdate < LOCK_STALE_MS) {
                 const msg = `Проект (${componentName}) заблокирован ${lockData.machineId === machineId ? 'другим окном' : 'другой машиной'}: ${lockData.hostname || 'Unknown'}.`;
                 if (!silent) vscode.window.showWarningMessage(msg, { modal: !silent });
-                this.releaseLocalLock(category);
+                if (repoRoot) this.releaseLocalLock(category, repoRoot);
                 return false;
             } else {
                 try {
@@ -132,11 +136,11 @@ export class LockManager {
             if (!silent) vscode.window.showErrorMessage(`Не удалось создать блокировку ${category}: ${error.message}`);
         }
         
-        this.releaseLocalLock(category);
+        if (repoRoot) this.releaseLocalLock(category, repoRoot);
         return false;
     }
 
-    static async releaseLock(drive: drive_v3.Drive, category: string) {
+    static async releaseLock(drive: drive_v3.Drive, category: string, repoRoot?: string) {
         this.stopHeartbeat(category);
         const remoteId = this.remoteLockIds.get(category);
         if (remoteId) {
@@ -145,7 +149,7 @@ export class LockManager {
             } catch (e) {}
             this.remoteLockIds.delete(category);
         }
-        this.releaseLocalLock(category);
+        if (repoRoot) this.releaseLocalLock(category, repoRoot);
         this.activeLocks.delete(category);
     }
 
