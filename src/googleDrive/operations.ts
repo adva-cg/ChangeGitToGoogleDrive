@@ -245,3 +245,40 @@ export async function updateRemoteLock(drive: drive_v3.Drive, fileId: string, lo
 export async function deleteRemoteLock(drive: drive_v3.Drive, fileId: string) {
     await drive.files.delete({ fileId });
 }
+
+export async function getBulkRemoteStructure(drive: drive_v3.Drive, rootFolderId: string): Promise<Map<string, any[]>> {
+    const fetchAllDescendants = async (parentId: string): Promise<any[]> => {
+        let results: any[] = [];
+        let pToken: string | undefined = undefined;
+        do {
+            const res: any = await drive.files.list({
+                q: `'${parentId}' in parents and trashed=false`,
+                fields: 'nextPageToken, files(id, name, md5Checksum, appProperties, mimeType, modifiedTime, parents)',
+                pageToken: pToken,
+            });
+            const files = res.data.files || [];
+            results = results.concat(files);
+            
+            pToken = res.data.nextPageToken || undefined;
+        } while (pToken);
+        
+        // Parallel fetch for subfolders
+        const subfolders = results.filter(f => f.mimeType === 'application/vnd.google-apps.folder');
+        const subResults: any[][] = await Promise.all(subfolders.map(f => fetchAllDescendants(f.id)));
+        
+        const flattened: any[] = [];
+        for (const sr of subResults) flattened.push(...sr);
+        return results.concat(flattened);
+    };
+
+    const allFiles = await fetchAllDescendants(rootFolderId);
+    
+    const parentIdMap = new Map<string, any[]>();
+    for (const file of allFiles) {
+        for (const parentId of (file.parents || [])) {
+            if (!parentIdMap.has(parentId)) parentIdMap.set(parentId, []);
+            parentIdMap.get(parentId)!.push(file);
+        }
+    }
+    return parentIdMap;
+}

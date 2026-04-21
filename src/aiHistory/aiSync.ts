@@ -18,7 +18,7 @@ import {
     findOrCreateBaseProjectFolder, 
     ensureSingleFolder,
     findOrCreateSubFolder,
-    getAllRemoteFiles,
+    getBulkRemoteStructure,
     downloadFile,
     updateFile,
     uploadFile
@@ -35,8 +35,6 @@ export async function trackCurrentConversation(context: vscode.ExtensionContext)
         if (!projectConversationIds.includes(conversationId)) {
             const updatedIds = [...projectConversationIds, conversationId];
             await context.workspaceState.update(ANTIGRAVITY_IDS_KEY, updatedIds);
-            // Если мы только что добавили беседу, возможно стоит сразу обновить манифест в облаке,
-            // но мы дождемся плановой или ручной синхронизации для экономии запросов.
         }
     } catch (e) {
         console.error('Error tracking current conversation:', e);
@@ -51,7 +49,6 @@ async function getCurrentConversationId() {
             const stats = await fs.stat(path.join(ANTIGRAVITY_BRAIN_PATH, name));
             return { name, mtime: stats.mtime };
         }));
-        // Игнорируем временные папки
         const validFolders = folderDetails.filter(f => f.name.length > 20); 
         validFolders.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
         return validFolders.length > 0 ? validFolders[0].name : null;
@@ -102,64 +99,109 @@ export async function syncAntigravity(context: vscode.ExtensionContext, silent: 
     const lockAcquired = await LockManager.acquireLock(drive, projectFolderId, 'antigravity', 'Antigravity Sync', silent);
     if (!lockAcquired) return;
 
-    if (!silent) vscode.window.showInformationMessage('Синхронизация Antigravity...');
     try {
-        const historyFolderId = await findOrCreateAntigravityFolder(drive, workspaceRoot, context);
-        const manifestId = await findOrCreateAntigravityManifest(drive, historyFolderId);
-        if (!manifestId) return;
-        const { data: manifestContent }: any = await drive.files.get({ fileId: manifestId, alt: 'media' });
-        let remoteManifest: any = typeof manifestContent === 'object' ? manifestContent : JSON.parse(manifestContent || '{}');
-        const projectConversationIds = context.workspaceState.get<string[]>(ANTIGRAVITY_IDS_KEY, []);
-        const allRelevantIds = new Set([...projectConversationIds, ...(remoteManifest.ids || [])]);
-        const machineId = vscode.env.machineId;
-
-        for (const convId of allRelevantIds) {
-            const localBrainPath = path.join(ANTIGRAVITY_BRAIN_PATH, convId);
-            const localPbPath = path.join(ANTIGRAVITY_CONVERSATIONS_PATH, `${convId}.pb`);
-            const localAnnotPath = path.join(ANTIGRAVITY_ANNOTATIONS_PATH, `${convId}.pbtxt`);
-            const localImplicitPath = path.join(ANTIGRAVITY_IMPLICIT_PATH, `${convId}.pb`);
-
-            const remoteConvFolderId = await findOrCreateSubFolder(drive, historyFolderId, convId, context);
+        await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: "Синхронизация Antigravity",
+            cancellable: false
+        }, async (progress) => {
+            progress.report({ message: "Получение структуры облака..." });
+            const historyFolderId = await findOrCreateAntigravityFolder(drive, workspaceRoot, context);
+            const knowledgeFolderId = await findOrCreateAntigravityKnowledgeFolder(drive, workspaceRoot, context);
             
-            // 1. Синхронизируем папку brain (артефакты, логи)
-            if (fsSync.existsSync(localBrainPath)) await syncFolder(drive, localBrainPath, remoteConvFolderId, machineId, silent);
-            else await downloadFolder(drive, remoteConvFolderId, localBrainPath);
+            // Включаем параллельное получение структур для ускорения
+            const [remoteManifestId, remoteHistoryStructure, remoteKnowledgeStructure] = await Promise.all([
+                findOrCreateAntigravityManifest(drive, historyFolderId),
+                getBulkRemoteStructure(drive, historyFolderId),
+                getBulkRemoteStructure(drive, knowledgeFolderId)
+            ]);
 
-            const remoteFiles = await getAllRemoteFiles(drive, remoteConvFolderId);
+            if (!remoteManifestId) return;
+            const { data: manifestContent }: any = await drive.files.get({ fileId: remoteManifestId, alt: 'media' });
+            let remoteManifest: any = typeof manifestContent === 'object' ? manifestContent : JSON.parse(manifestContent || '{}');
+            const projectConversationIds = context.workspaceState.get<string[]>(ANTIGRAVITY_IDS_KEY, []);
+            const allRelevantIds = Array.from(new Set([...projectConversationIds, ...(remoteManifest.ids || [])]));
+            const machineId = vscode.env.machineId;
+
+            const total = allRelevantIds.length;
+            let currentCount = 0;
+
+            const syncConversation = async (convId: string) => {
+                try {
+                    const localBrainPath = path.join(ANTIGRAVITY_BRAIN_PATH, convId);
+                    const localPbPath = path.join(ANTIGRAVITY_CONVERSATIONS_PATH, `${convId}.pb`);
+                    const localAnnotPath = path.join(ANTIGRAVITY_ANNOTATIONS_PATH, `${convId}.pbtxt`);
+                    const localImplicitPath = path.join(ANTIGRAVITY_IMPLICIT_PATH, `${convId}.pb`);
+
+                    // Находим или создаем папку беседы
+                    const convFiles = remoteHistoryStructure.get(historyFolderId) || [];
+                    let remoteConvFolder = convFiles.find(f => f.name === convId && f.mimeType === 'application/vnd.google-apps.folder');
+                    let remoteConvFolderId: string;
+                    
+                    if (!remoteConvFolder) {
+                        remoteConvFolderId = await findOrCreateSubFolder(drive, historyFolderId, convId, context);
+                    } else {
+                        remoteConvFolderId = remoteConvFolder.id;
+                    }
+
+                    // 1. Синхронизируем папку brain
+                    if (fsSync.existsSync(localBrainPath)) {
+                        await syncFolderBulk(drive, localBrainPath, remoteConvFolderId, remoteHistoryStructure, machineId, silent);
+                    } else {
+                        await downloadFolderBulk(drive, remoteConvFolderId, remoteHistoryStructure, localBrainPath);
+                    }
+
+                    const subFiles = remoteHistoryStructure.get(remoteConvFolderId) || [];
+
+                    // 2. PB файл
+                    const remotePbFile = subFiles.find(f => f.name === `${convId}.pb`);
+                    if (fsSync.existsSync(localPbPath)) {
+                        if (remotePbFile) await syncFileWithConflictResolution(drive, localPbPath, remotePbFile, machineId, silent);
+                        else await uploadFile(drive, remoteConvFolderId, localPbPath, `${convId}.pb`, machineId);
+                    } else if (remotePbFile) await downloadFile(drive, remotePbFile.id, localPbPath);
+
+                    // 3. Annotations (.pbtxt)
+                    const remoteAnnotFile = subFiles.find(f => f.name === `${convId}.pbtxt`);
+                    if (fsSync.existsSync(localAnnotPath)) {
+                        if (remoteAnnotFile) await syncFileWithConflictResolution(drive, localAnnotPath, remoteAnnotFile, machineId, silent);
+                        else await uploadFile(drive, remoteConvFolderId, localAnnotPath, `${convId}.pbtxt`, machineId);
+                    } else if (remoteAnnotFile) await downloadFile(drive, remoteAnnotFile.id, localAnnotPath);
+
+                    // 4. Implicit
+                    const remoteImplicitFile = subFiles.find(f => f.name === `${convId}.implicit.pb`);
+                    if (fsSync.existsSync(localImplicitPath)) {
+                        if (remoteImplicitFile) await syncFileWithConflictResolution(drive, localImplicitPath, remoteImplicitFile, machineId, silent);
+                        else await uploadFile(drive, remoteConvFolderId, localImplicitPath, `${convId}.implicit.pb`, machineId);
+                    } else if (remoteImplicitFile) await downloadFile(drive, remoteImplicitFile.id, localImplicitPath);
+
+                } catch (e) {
+                    console.error(`Error syncing conversation ${convId}:`, e);
+                } finally {
+                    currentCount++;
+                    progress.report({ message: `Беседы: ${currentCount}/${total}`, increment: (1 / total) * 100 });
+                }
+            };
+
+            // Параллельная обработка с ограничением (chunks of 5)
+            const chunkSize = 5;
+            for (let i = 0; i < allRelevantIds.length; i += chunkSize) {
+                const chunk = allRelevantIds.slice(i, i + chunkSize);
+                await Promise.all(chunk.map(id => syncConversation(id)));
+            }
+
+            progress.report({ message: "Синхронизация базы знаний..." });
+            await syncFolderBulk(drive, ANTIGRAVITY_KNOWLEDGE_PATH, knowledgeFolderId, remoteKnowledgeStructure, machineId, silent);
+
+            const mergedIds = allRelevantIds;
+            await context.workspaceState.update(ANTIGRAVITY_IDS_KEY, mergedIds);
+            await drive.files.update({ 
+                fileId: remoteManifestId, 
+                media: { mimeType: 'application/json', body: JSON.stringify({ ids: mergedIds }) } 
+            });
             
-            // 2. Синхронизируем основной .pb файл беседы
-            const remotePbFile = remoteFiles.find(f => f.name === `${convId}.pb`);
-            if (fsSync.existsSync(localPbPath)) {
-                if (remotePbFile) await syncFileWithConflictResolution(drive, localPbPath, remotePbFile, machineId, silent);
-                else await uploadFile(drive, remoteConvFolderId, localPbPath, `${convId}.pb`, machineId);
-            } else if (remotePbFile) await downloadFile(drive, remotePbFile.id, localPbPath);
-
-            // 3. Синхронизируем аннотацию (.pbtxt) - критично для отображения в списке
-            const remoteAnnotFile = remoteFiles.find(f => f.name === `${convId}.pbtxt`);
-            if (fsSync.existsSync(localAnnotPath)) {
-                if (remoteAnnotFile) await syncFileWithConflictResolution(drive, localAnnotPath, remoteAnnotFile, machineId, silent);
-                else await uploadFile(drive, remoteConvFolderId, localAnnotPath, `${convId}.pbtxt`, machineId);
-            } else if (remoteAnnotFile) await downloadFile(drive, remoteAnnotFile.id, localAnnotPath);
-
-            // 4. Синхронизируем implicit данные (.pb)
-            const remoteImplicitFile = remoteFiles.find(f => f.name === `${convId}.implicit.pb`);
-            if (fsSync.existsSync(localImplicitPath)) {
-                if (remoteImplicitFile) await syncFileWithConflictResolution(drive, localImplicitPath, remoteImplicitFile, machineId, silent);
-                else await uploadFile(drive, remoteConvFolderId, localImplicitPath, `${convId}.implicit.pb`, machineId);
-            } else if (remoteImplicitFile) await downloadFile(drive, remoteImplicitFile.id, localImplicitPath);
-        }
-
-        const knowledgeFolderId = await findOrCreateAntigravityKnowledgeFolder(drive, workspaceRoot, context);
-        await syncFolder(drive, ANTIGRAVITY_KNOWLEDGE_PATH, knowledgeFolderId, machineId, silent);
-
-        const mergedIds = Array.from(allRelevantIds);
-        await context.workspaceState.update(ANTIGRAVITY_IDS_KEY, mergedIds);
-        await drive.files.update({ fileId: manifestId, media: { mimeType: 'application/json', body: JSON.stringify({ ids: mergedIds }) } });
-        
-        // В конце синхронизации пробуем подхватить текущую беседу, если она сменилась
-        await trackCurrentConversation(context);
-
-        if (!silent) vscode.window.showInformationMessage('Синхронизация Antigravity завершена.');
+            await trackCurrentConversation(context);
+            if (!silent) vscode.window.showInformationMessage('Синхронизация Antigravity успешно завершена.');
+        });
     } catch (error: any) {
         vscode.window.showErrorMessage(`Ошибка синхронизации Antigravity: ${error.message}`);
     } finally {
@@ -167,17 +209,25 @@ export async function syncAntigravity(context: vscode.ExtensionContext, silent: 
     }
 }
 
-async function syncFolder(drive: drive_v3.Drive, localPath: string, remoteFolderId: string, machineId: string, silent: boolean) {
+async function syncFolderBulk(drive: drive_v3.Drive, localPath: string, remoteFolderId: string, remoteStructure: Map<string, any[]>, machineId: string, silent: boolean) {
     try {
         const localEntries = await fs.readdir(localPath);
-        const remoteFiles = await getAllRemoteFiles(drive, remoteFolderId);
+        const remoteFiles = remoteStructure.get(remoteFolderId) || [];
+        
         for (const entry of localEntries) {
             if (entry === 'knowledge.lock') continue;
             const entryPath = path.join(localPath, entry);
             const stats = await fs.stat(entryPath);
+            
             if (stats.isDirectory()) {
-                const subId = await findOrCreateSubFolder(drive, remoteFolderId, entry);
-                await syncFolder(drive, entryPath, subId, machineId, silent);
+                let remoteSubFolder = remoteFiles.find(f => f.name === entry && f.mimeType === 'application/vnd.google-apps.folder');
+                let remoteSubFolderId: string;
+                if (!remoteSubFolder) {
+                    remoteSubFolderId = await findOrCreateSubFolder(drive, remoteFolderId, entry);
+                } else {
+                    remoteSubFolderId = remoteSubFolder.id;
+                }
+                await syncFolderBulk(drive, entryPath, remoteSubFolderId, remoteStructure, machineId, silent);
             } else {
                 const remoteFile = remoteFiles.find(f => f.name === entry);
                 if (remoteFile) await syncFileWithConflictResolution(drive, entryPath, remoteFile, machineId, silent);
@@ -187,26 +237,41 @@ async function syncFolder(drive: drive_v3.Drive, localPath: string, remoteFolder
     } catch (e) {}
 }
 
-async function syncFileWithConflictResolution(drive: drive_v3.Drive, localPath: string, remoteFile: any, machineId: string, silent: boolean) {
-    if (!fsSync.existsSync(localPath)) return; // Prevents errors if file was deleted during sync
-    const localMd5 = await getFileMd5(localPath);
-    if (localMd5 === remoteFile.md5Checksum) return;
-    const stats = await fs.stat(localPath);
-    const localTime = stats.mtime.getTime();
-    const remoteTime = remoteFile.modifiedTime ? new Date(remoteFile.modifiedTime).getTime() : 0;
-    if (remoteTime > localTime + 2000 && remoteFile.id) await downloadFile(drive, remoteFile.id, localPath);
-    else if (localTime > remoteTime + 2000 && remoteFile.id) await updateFile(drive, remoteFile.id, localPath, machineId);
-    else if (silent) await downloadFile(drive, remoteFile.id, localPath);
-    else {
-        const choice = await vscode.window.showQuickPick(['Download', 'Upload', 'Compare'], { placeHolder: `Conflict in Antigravity file: ${path.basename(localPath)}` });
-        if (choice === 'Download') await downloadFile(drive, remoteFile.id, localPath);
-        else if (choice === 'Upload') await updateFile(drive, remoteFile.id, localPath, machineId);
+async function downloadFolderBulk(drive: drive_v3.Drive, remoteFolderId: string, remoteStructure: Map<string, any[]>, localPath: string) {
+    await fs.mkdir(localPath, { recursive: true });
+    const remoteFiles = remoteStructure.get(remoteFolderId) || [];
+    for (const file of remoteFiles) {
+        const destPath = path.join(localPath, file.name);
+        if (file.mimeType === 'application/vnd.google-apps.folder') {
+            await downloadFolderBulk(drive, file.id, remoteStructure, destPath);
+        } else {
+            await downloadFile(drive, file.id, destPath);
+        }
     }
 }
 
-async function downloadFolder(drive: drive_v3.Drive, remoteFolderId: string, localPath: string) {
-    const remoteFiles = await getAllRemoteFiles(drive, remoteFolderId, true);
-    for (const file of remoteFiles) await downloadFile(drive, file.id, path.join(localPath, file.name));
+async function syncFileWithConflictResolution(drive: drive_v3.Drive, localPath: string, remoteFile: any, machineId: string, silent: boolean) {
+    if (!fsSync.existsSync(localPath)) return;
+    const localMd5 = await getFileMd5(localPath);
+    if (localMd5 === remoteFile.md5Checksum) return;
+    
+    const stats = await fs.stat(localPath);
+    const localTime = stats.mtime.getTime();
+    const remoteTime = remoteFile.modifiedTime ? new Date(remoteFile.modifiedTime).getTime() : 0;
+    
+    if (remoteTime > localTime + 2000 && remoteFile.id) {
+        await downloadFile(drive, remoteFile.id, localPath);
+    } else if (localTime > remoteTime + 2000 && remoteFile.id) {
+        await updateFile(drive, remoteFile.id, localPath, machineId);
+    } else if (silent) {
+        await downloadFile(drive, remoteFile.id, localPath);
+    } else {
+        const choice = await vscode.window.showQuickPick(['Download', 'Upload', 'Compare'], { 
+            placeHolder: `Конфликт в файле: ${path.basename(localPath)}` 
+        });
+        if (choice === 'Download') await downloadFile(drive, remoteFile.id, localPath);
+        else if (choice === 'Upload') await updateFile(drive, remoteFile.id, localPath, machineId);
+    }
 }
 
 async function findOrCreateAntigravityFolder(drive: drive_v3.Drive, workspaceRoot: string, context: vscode.ExtensionContext) {
@@ -219,7 +284,11 @@ async function findOrCreateAntigravityManifest(drive: drive_v3.Drive, historyFol
     const q = `name='${fileName}' and '${historyFolderId}' in parents and trashed=false`;
     const res = await drive.files.list({ q, fields: 'files(id)' });
     if (res.data.files?.length) return res.data.files[0].id;
-    const { data } = await drive.files.create({ requestBody: { name: fileName, parents: [historyFolderId] }, media: { mimeType: 'application/json', body: JSON.stringify({ ids: [] }) }, fields: 'id' });
+    const { data } = await drive.files.create({ 
+        requestBody: { name: fileName, parents: [historyFolderId] }, 
+        media: { mimeType: 'application/json', body: JSON.stringify({ ids: [] }) }, 
+        fields: 'id' 
+    });
     return data.id;
 }
 
