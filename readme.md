@@ -134,11 +134,26 @@
 
 ### Настройки
 
-Вы можете настроить поведение синхронизации неотслеживаемых файлов с помощью следующих настроек в вашем `settings.json`:
+Все настройки доступны в **Settings** VS Code: `Ctrl+,` → поиск `ChangeGitToGoogleDrive`, или команда `> ChangeGitToGoogleDrive: Открыть настройки расширения`.
 
--   `changegittogoogledrive-extension.untrackedFiles.include`: Массив glob-паттернов для включения файлов при загрузке. Например, `["**/*.env", "**/local.settings.json"]`.
--   `changegittogoogledrive-extension.untrackedFiles.autoUpload`: Включить автоматическую загрузку неотслеживаемых файлов при изменении. По умолчанию `false`.
--   `changegittogoogledrive-extension.untrackedFiles.syncOnStartup`: Включить автоматическую синхронизацию неотслеживаемых файлов при запуске. По умолчанию `true`.
+#### Неотслеживаемые файлы
+
+| Настройка | Где хранится | Описание |
+|-----------|--------------|----------|
+| `include`, `exclude` | Google Drive (`config.json`) + зеркало в Settings | При **старте** подтягиваются с Drive; при **изменении** в Settings автоматически отправляются на Drive |
+| `syncOnStartup` | Только локально | Авто-синхронизация неотслеживаемых файлов при запуске VS Code. По умолчанию `false` |
+| `autoUpload` | Только локально | Фоновая выгрузка на Drive каждые 2 минуты. По умолчанию `false` |
+
+Пример `include`: `["**/*.env", "**/local.settings.json"]`.
+
+#### Cloud Clipboard
+
+- `clipboard.syncEnabled` — включить облачный буфер обмена
+- `clipboard.syncInterval` — интервал проверки (мс)
+
+#### Учётные данные Google
+
+OAuth-токены и `client_secret.json` настраиваются **командами** (не через Settings): «Настроить учётные данные Google» и «Аутентификация с Google».
 
 ## Организация совместной работы
 

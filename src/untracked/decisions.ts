@@ -52,11 +52,10 @@ export async function updateCloudConfig(drive: drive_v3.Drive, projectFolderId: 
     }
 }
 
-export async function getEffectiveConfig(drive: drive_v3.Drive, projectFolderId: string) {
+export async function getCloudUntrackedConfig(drive: drive_v3.Drive, projectFolderId: string) {
     const cloudConfig = await getCloudConfig(drive, projectFolderId);
-    const localConfig = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
     return {
-        include: (cloudConfig?.include || localConfig.get('include', [])) as string[],
-        exclude: (cloudConfig?.exclude || localConfig.get('exclude', [])) as string[]
+        include: (cloudConfig?.include ?? []) as string[],
+        exclude: (cloudConfig?.exclude ?? []) as string[]
     };
 }

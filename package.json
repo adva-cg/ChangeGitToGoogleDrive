@@ -2,7 +2,7 @@
   "name": "changegittogoogledrive-extension",
   "displayName": "ChangeGitToGoogleDrive",
   "description": "A VS Code extension to sync git commits and untracked files with Google Drive",
-  "version": "1.8.1",
+  "version": "1.9.0",
   "publisher": "VitalyAdadurov",
   "repository": {
     "type": "git",
@@ -85,46 +85,68 @@
         "category": "Git-To-Google-Drive"
       },
       {
+        "command": "changegittogoogledrive-extension.openSettings",
+        "title": "Открыть настройки расширения",
+        "category": "Git-To-Google-Drive"
+      },
+      {
         "command": "changegittogoogledrive-extension.showDiagnostics",
         "title": "Показать диагностику (Show Diagnostics)",
         "category": "Git-To-Google-Drive"
       }
     ],
-    "configuration": {
-      "title": "ChangeGitToGoogleDrive Settings",
-      "properties": {
-        "changegittogoogledrive-extension.untrackedFiles.include": {
-          "type": "array",
-          "default": [],
-          "description": "Массив glob-шаблонов для файлов, которые должны синхронизироваться как 'неотслеживаемые'."
-        },
-        "changegittogoogledrive-extension.untrackedFiles.autoUpload": {
-          "type": "boolean",
-          "default": false,
-          "description": "Автоматически выгружать неотслеживаемые файлы при их изменении."
-        },
-        "changegittogoogledrive-extension.untrackedFiles.syncOnStartup": {
-          "type": "boolean",
-          "default": false,
-          "description": "Автоматически синхронизировать неотслеживаемые файлы при запуске VS Code."
-        },
-        "changegittogoogledrive-extension.untrackedFiles.exclude": {
-          "type": "array",
-          "default": [],
-          "description": "Массив glob-шаблонов для исключения файлов из синхронизации. Имеет приоритет над 'include'."
-        },
-        "changegittogoogledrive-extension.clipboard.syncEnabled": {
-          "type": "boolean",
-          "default": false,
-          "description": "Включить общую облачную корзину (Cloud Clipboard) через Google Drive."
-        },
-        "changegittogoogledrive-extension.clipboard.syncInterval": {
-          "type": "integer",
-          "default": 5000,
-          "description": "Интервал проверки буфера обмена в миллисекундах (минимум 1000)."
+    "configuration": [
+      {
+        "title": "Неотслеживаемые файлы",
+        "order": 1,
+        "properties": {
+          "changegittogoogledrive-extension.untrackedFiles.include": {
+            "type": "array",
+            "default": [],
+            "scope": "resource",
+            "order": 1,
+            "description": "Glob-шаблоны для синхронизации. Хранится на Google Drive (config.json), при старте подтягивается сюда; при изменении — автоматически отправляется на Drive."
+          },
+          "changegittogoogledrive-extension.untrackedFiles.exclude": {
+            "type": "array",
+            "default": [],
+            "scope": "resource",
+            "order": 2,
+            "description": "Glob-шаблоны для исключения файлов из синхронизации. Имеет приоритет над 'include'. Синхронизируется с Google Drive."
+          },
+          "changegittogoogledrive-extension.untrackedFiles.syncOnStartup": {
+            "type": "boolean",
+            "default": false,
+            "order": 3,
+            "description": "Автоматически синхронизировать неотслеживаемые файлы при запуске VS Code."
+          },
+          "changegittogoogledrive-extension.untrackedFiles.autoUpload": {
+            "type": "boolean",
+            "default": false,
+            "order": 4,
+            "description": "Автоматически выгружать неотслеживаемые файлы на Google Drive каждые 2 минуты."
+          }
+        }
+      },
+      {
+        "title": "Cloud Clipboard",
+        "order": 2,
+        "properties": {
+          "changegittogoogledrive-extension.clipboard.syncEnabled": {
+            "type": "boolean",
+            "default": false,
+            "order": 1,
+            "description": "Включить общую облачную корзину (Cloud Clipboard) через Google Drive."
+          },
+          "changegittogoogledrive-extension.clipboard.syncInterval": {
+            "type": "integer",
+            "default": 5000,
+            "order": 2,
+            "description": "Интервал проверки буфера обмена в миллисекундах (минимум 1000)."
+          }
         }
       }
-    }
+    ]
   },
   "devDependencies": {
     "@types/glob": "^8.1.0",

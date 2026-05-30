@@ -4,6 +4,7 @@ import { initialUpload, sync, installGitHooks, cloneFromGoogleDrive, manageSyncH
 import { uploadUntrackedFiles, syncUntrackedFiles, deleteUntrackedFile, clearTombstones } from './untracked/untrackedSync';
 import { toggleClipboardSync, setupCloudClipboard } from './clipboard/clipboardSync';
 import { showDiagnostics } from './utils/diagnostics';
+import { setupUntrackedConfigSync, pullUntrackedConfigForAllRepos, openExtensionSettings } from './settings/untrackedConfigSync';
 
 
 export function activate(context: vscode.ExtensionContext) {
@@ -22,6 +23,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('changegittogoogledrive-extension.clearTombstones', () => clearTombstones(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.manageSyncHash', () => manageSyncHash(context)),
         vscode.commands.registerCommand('changegittogoogledrive-extension.toggleClipboardSync', () => toggleClipboardSync(context)),
+        vscode.commands.registerCommand('changegittogoogledrive-extension.openSettings', () => openExtensionSettings()),
         vscode.commands.registerCommand('changegittogoogledrive-extension.showDiagnostics', () => showDiagnostics(context))
     );
 
@@ -33,18 +35,28 @@ export function activate(context: vscode.ExtensionContext) {
     // Мониторинг веток
     setupBranchMonitoring(context);
 
+    // Синхронизация настроек неотслеживаемых файлов с Google Drive
+    setupUntrackedConfigSync(context);
+    pullUntrackedConfigForAllRepos(context).catch(e => console.error('Initial untracked config pull failed:', e));
+
     // Авто-синхронизация при открытии
     sync(context, true).catch(e => console.error('Initial git sync failed:', e));
-    syncUntrackedFiles(context, true).catch(e => console.error('Initial untracked sync failed:', e));
+
+    const untrackedConfig = vscode.workspace.getConfiguration('changegittogoogledrive-extension.untrackedFiles');
+    if (untrackedConfig.get<boolean>('syncOnStartup', false)) {
+        syncUntrackedFiles(context, true).catch(e => console.error('Initial untracked sync failed:', e));
+    }
 
     // Настройка облачного буфера обмена
     setupCloudClipboard(context);
 
-    // Периодическая выгрузка новых файлов (на всякий случай)
-    const uploadInterval = setInterval(() => {
-        uploadUntrackedFiles(context, true);
-    }, 120000); // каждые 2 минуты
-    context.subscriptions.push({ dispose: () => clearInterval(uploadInterval) });
+    // Периодическая выгрузка новых файлов
+    if (untrackedConfig.get<boolean>('autoUpload', false)) {
+        const uploadInterval = setInterval(() => {
+            uploadUntrackedFiles(context, true);
+        }, 120000);
+        context.subscriptions.push({ dispose: () => clearInterval(uploadInterval) });
+    }
 }
 
 export function deactivate() {}

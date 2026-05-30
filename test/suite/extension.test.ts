@@ -28,7 +28,8 @@ suite('Extension Test Suite', () => {
             'changegittogoogledrive-extension.sync',
             'changegittogoogledrive-extension.installGitHooks',
             'changegittogoogledrive-extension.manageSyncHash',
-            'changegittogoogledrive-extension.toggleClipboardSync'
+            'changegittogoogledrive-extension.toggleClipboardSync',
+            'changegittogoogledrive-extension.openSettings'
         ];
 
         for (const cmd of expectedCommands) {

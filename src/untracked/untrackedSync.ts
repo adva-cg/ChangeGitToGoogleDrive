@@ -26,9 +26,10 @@ import { LockManager } from '../googleDrive/lockManager';
 import { 
     getConflictDecisions, 
     setConflictDecision, 
-    getEffectiveConfig, 
+    getCloudUntrackedConfig, 
     updateCloudConfig 
 } from './decisions';
+import { pullUntrackedConfigFromDrive, applyUntrackedConfigToWorkspace } from '../settings/untrackedConfigSync';
 
 export async function syncUntrackedFiles(context: vscode.ExtensionContext, silent: boolean = false, repo?: GitRepository) {
     if (!repo) {
@@ -57,7 +58,8 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
         const tombstones = await getAllRemoteFiles(drive, deletedFolderId, true);
         const tombstoneSet = new Set(tombstones.map(f => f.name));
         const decisions = getConflictDecisions(context);
-        let config = await getEffectiveConfig(drive, projectFolderId);
+        await pullUntrackedConfigFromDrive(context, repoRoot, drive, projectFolderId);
+        let config = await getCloudUntrackedConfig(drive, projectFolderId);
         const localFiles = await getUntrackedAndIgnoredFiles(repoRoot);
         const remoteFiles = await getAllRemoteFiles(drive, untrackedFolderId);
         const machineId = vscode.env.machineId;
@@ -107,6 +109,7 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
                 if (choice === 'Yes') {
                     config.include.push(remoteFile.name);
                     await updateCloudConfig(drive, projectFolderId, config);
+                    await applyUntrackedConfigToWorkspace(repoRoot, config);
                 } else if (choice === 'Never') {
                     await setConflictDecision(context, { key: decisionKey, data: { decision: 'ignore_suggestion' } });
                 }
@@ -173,7 +176,8 @@ export async function uploadUntrackedFiles(context: vscode.ExtensionContext, sil
 
     try {
         const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, repoRoot, context);
-        const config = await getEffectiveConfig(drive, projectFolderId);
+        await pullUntrackedConfigFromDrive(context, repoRoot, drive, projectFolderId);
+        const config = await getCloudUntrackedConfig(drive, projectFolderId);
         const allFiles = await getUntrackedAndIgnoredFiles(repoRoot);
         const toUpload = allFiles.filter(f => isFileIncluded(f, config.include, config.exclude));
         const machineId = vscode.env.machineId;
@@ -212,7 +216,8 @@ export async function deleteUntrackedFile(context: vscode.ExtensionContext) {
     try {
         const projectFolderId = await findOrCreateBaseProjectFolder(drive, repoRoot, context);
         const untrackedFolderId = await findOrCreateUntrackedFilesFolder(drive, repoRoot, context);
-        const config = await getEffectiveConfig(drive, projectFolderId);
+        await pullUntrackedConfigFromDrive(context, repoRoot, drive, projectFolderId);
+        const config = await getCloudUntrackedConfig(drive, projectFolderId);
         const localFiles = await getUntrackedAndIgnoredFiles(repoRoot);
         const filesToList = localFiles.filter(f => isFileIncluded(f, config.include, config.exclude));
         const selected = await vscode.window.showQuickPick(filesToList, { canPickMany: true });
