@@ -28,8 +28,6 @@ suite('Extension Test Suite', () => {
             'changegittogoogledrive-extension.sync',
             'changegittogoogledrive-extension.installGitHooks',
             'changegittogoogledrive-extension.manageSyncHash',
-            'changegittogoogledrive-extension.configureAIHistorySync',
-            'changegittogoogledrive-extension.syncAIHistory',
             'changegittogoogledrive-extension.toggleClipboardSync'
         ];
 

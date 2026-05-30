@@ -1,8 +1,8 @@
 {
   "name": "changegittogoogledrive-extension",
   "displayName": "ChangeGitToGoogleDrive",
-  "description": "A VS Code extension to sync git commits, untracked files, and AI history/knowledge with Google Drive",
-  "version": "1.8.0",
+  "description": "A VS Code extension to sync git commits and untracked files with Google Drive",
+  "version": "1.8.1",
   "publisher": "VitalyAdadurov",
   "repository": {
     "type": "git",
@@ -80,16 +80,6 @@
         "category": "Git-To-Google-Drive"
       },
       {
-        "command": "changegittogoogledrive-extension.syncAIHistory",
-        "title": "Синхронизировать Antigravity Sync",
-        "category": "Git-To-Google-Drive"
-      },
-      {
-        "command": "changegittogoogledrive-extension.configureAIHistorySync",
-        "title": "Настроить Antigravity Sync для этого проекта",
-        "category": "Git-To-Google-Drive"
-      },
-      {
         "command": "changegittogoogledrive-extension.toggleClipboardSync",
         "title": "Cloud Clipboard: Вкл/Выкл синхронизацию",
         "category": "Git-To-Google-Drive"
@@ -101,7 +91,7 @@
       }
     ],
     "configuration": {
-      "title": "Antigravity Sync Settings",
+      "title": "ChangeGitToGoogleDrive Settings",
       "properties": {
         "changegittogoogledrive-extension.untrackedFiles.include": {
           "type": "array",
@@ -122,21 +112,6 @@
           "type": "array",
           "default": [],
           "description": "Массив glob-шаблонов для исключения файлов из синхронизации. Имеет приоритет над 'include'."
-        },
-        "changegittogoogledrive-extension.aiHistory.syncMode": {
-          "type": "string",
-          "default": "ask",
-          "enum": [
-            "ask",
-            "always",
-            "never"
-          ],
-          "description": "Как синхронизировать бесед Antigravity. 'ask' - спрашивать для каждого проекта."
-        },
-        "changegittogoogledrive-extension.aiHistory.autoSync": {
-          "type": "boolean",
-          "default": false,
-          "description": "Автоматически синхронизировать Antigravity Sync при запуске VS Code."
         },
         "changegittogoogledrive-extension.clipboard.syncEnabled": {
           "type": "boolean",

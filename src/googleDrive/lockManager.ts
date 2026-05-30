@@ -25,7 +25,7 @@ export class LockManager {
         if (repoRoot) {
             return path.join(repoRoot, '.git', fileName);
         } else {
-            // Global lock for things like Antigravity sync
+            // Global lock for cross-project operations
             return path.join(os.homedir(), '.vscode-gdrive-git', fileName);
         }
     }

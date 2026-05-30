@@ -1,7 +1,5 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
 import { getGitRepositories } from './common';
-import { ANTIGRAVITY_BRAIN_PATH, ANTIGRAVITY_ENABLED_KEY } from '../constants';
 import { getAuthenticatedClient } from '../googleDrive/auth';
 
 export async function showDiagnostics(context: vscode.ExtensionContext) {
@@ -30,27 +28,7 @@ export async function showDiagnostics(context: vscode.ExtensionContext) {
     }
     outputChannel.appendLine('');
 
-    // 2. Antigravity status
-    outputChannel.appendLine('--- Antigravity (AI History) Status ---');
-    const agEnabled = context.globalState.get<boolean>(ANTIGRAVITY_ENABLED_KEY, false);
-    outputChannel.appendLine(`Global Enabled: ${agEnabled}`);
-    outputChannel.appendLine(`Brain Path: ${ANTIGRAVITY_BRAIN_PATH}`);
-    
-    const fs = require('fs');
-    if (fs.existsSync(ANTIGRAVITY_BRAIN_PATH)) {
-        outputChannel.appendLine('Brain folder exists: Yes');
-        const historyPath = path.join(ANTIGRAVITY_BRAIN_PATH, '.system_generated', 'logs');
-        if (fs.existsSync(historyPath)) {
-             outputChannel.appendLine('History logs folder exists: Yes');
-        } else {
-             outputChannel.appendLine('History logs folder missing (Expected if no AG history exists yet)');
-        }
-    } else {
-        outputChannel.appendLine('Brain folder exists: No (Antigravity might not be configured or path is different)');
-    }
-    outputChannel.appendLine('');
-
-    // 3. Google Drive
+    // 2. Google Drive
     outputChannel.appendLine('--- Google Drive Status ---');
     try {
         const drive = await getAuthenticatedClient(context);
