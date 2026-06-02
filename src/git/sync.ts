@@ -196,6 +196,12 @@ async function pushCommits(context: vscode.ExtensionContext, drive: drive_v3.Dri
     const sanitizedBranchName = sanitizeBranchNameForDrive(currentBranch);
     const bundleFileName = `${sanitizedBranchName}--${currentHead}.bundle`;
     const bundlePath = path.join(repoRoot, '.git', bundleFileName);
+    
+    // Clean up any stale bundle file from a previous interrupted run
+    if (fsSync.existsSync(bundlePath)) {
+        await fs.unlink(bundlePath).catch(() => {});
+    }
+
     try {
         await runCommand(`git bundle create \"${bundlePath}\" ${revisionRange}`, repoRoot);
         const media = { mimeType: 'application/octet-stream', body: fsSync.createReadStream(bundlePath) };
@@ -226,6 +232,9 @@ async function pullCommits(context: vscode.ExtensionContext, drive: drive_v3.Dri
         remoteBundlesByBranch.get(branchName)!.push(bundle);
     }
     const tempDir = path.join(repoRoot, '.git', 'gdrive-temp-bundles');
+    if (fsSync.existsSync(tempDir)) {
+        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
     await fs.mkdir(tempDir, { recursive: true });
     try {
         for (const [branchName, bundles] of remoteBundlesByBranch.entries()) {
@@ -327,6 +336,9 @@ export async function cloneFromGoogleDrive(context: vscode.ExtensionContext) {
         const selectedBundle = await vscode.window.showQuickPick((resRemote.data as any).files.map((b: any) => ({ label: b.name!, id: b.id! })), { placeHolder: 'Select the bundle' }) as any;
         if (!selectedBundle) return;
         const tempDir = path.join(workspaceRoot, '.gdrive-temp-clone');
+        if (fsSync.existsSync(tempDir)) {
+            await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+        }
         await fs.mkdir(tempDir, { recursive: true });
         const tempBundlePath = path.join(tempDir, selectedBundle.label);
         await downloadFile(drive, selectedBundle.id, tempBundlePath);
