@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { google } from 'googleapis';
+import { google, drive_v3 } from 'googleapis';
 import { promises as fs } from 'fs';
 import * as url from 'url';
 import * as http from 'http';
@@ -78,7 +78,7 @@ export async function authenticateWithGoogle(context: vscode.ExtensionContext) {
     });
 }
 
-export async function getAuthenticatedClient(context: vscode.ExtensionContext) {
+export async function getAuthenticatedClient(context: vscode.ExtensionContext): Promise<drive_v3.Drive | null> {
     const credentialsStr = await context.secrets.get(GOOGLE_DRIVE_CREDENTIALS_KEY);
     const tokensStr = await context.secrets.get(GOOGLE_DRIVE_TOKENS_KEY);
 
@@ -123,5 +123,9 @@ export async function getAuthenticatedClient(context: vscode.ExtensionContext) {
             return null;
         }
     }
-    return google.drive({ version: 'v3', auth: oauth2Client });
+    return google.drive({ 
+        version: 'v3', 
+        auth: oauth2Client,
+        timeout: 60000 // 60 seconds request timeout
+    } as any) as any as drive_v3.Drive;
 }

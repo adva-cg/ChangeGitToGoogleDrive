@@ -79,7 +79,7 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
             return isMissingLocally && isNotTombstone && (wasKnownLocally || isSameMachine);
         }).map(f => f.name);
 
-        if (disappearedFiles.length > 0) {
+        if (disappearedFiles.length > 0 && !silent) {
             const choice = await vscode.window.showWarningMessage(
                 `[${repoName}] Detected ${disappearedFiles.length} locally deleted files. Mark them as deleted on Google Drive too?`,
                 'Yes', 'No'
@@ -90,7 +90,7 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
                     if (remote && remote.id) {
                         const { data: { parents } } = await drive.files.get({ fileId: remote.id, fields: 'parents' });
                         if (parents?.length && parents[0]) {
-                            await drive.files.update({ fileId: remote.id, addParents: deletedFolderId, removeParents: parents[0] });
+                            await drive.files.update({ fileId: remote.id, addParents: deletedFolderId, removeParents: parents[0] } as any);
                         }
                     }
                 }
@@ -103,6 +103,7 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
         for (const remoteFile of remoteFiles) {
             const localPath = path.join(repoRoot, remoteFile.name);
             if (!fsSync.existsSync(localPath) && !isFileIncluded(remoteFile.name, config.include, config.exclude)) {
+                if (silent) continue;
                 const decisionKey = `suggest_track_${repoName}_${remoteFile.name}`;
                 if (decisions[decisionKey]) continue;
                 const choice = await vscode.window.showInformationMessage(`[${repoName}] Found new file on Drive: "${remoteFile.name}". Track it?`, 'Yes', 'No', 'Never');
@@ -119,6 +120,7 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
         for (const tombstonePath of tombstoneSet) {
             const localPath = path.join(repoRoot, tombstonePath);
             if (fsSync.existsSync(localPath)) {
+                if (silent) continue;
                 const choice = await vscode.window.showWarningMessage(`[${repoName}] File "${tombstonePath}" was deleted elsewhere. Delete local?`, 'Yes', 'No');
                 if (choice === 'Yes') await fs.unlink(localPath);
             }
@@ -131,6 +133,7 @@ export async function syncUntrackedFiles(context: vscode.ExtensionContext, silen
                 const localMd5 = await getFileMd5(localPath);
                 if (localMd5 !== remoteFile.md5Checksum) {
                     if (remoteFile.appProperties?.machineId === machineId) continue;
+                    if (silent) continue;
                     const choice = await vscode.window.showQuickPick(['Download', 'Upload', 'Skip'], { placeHolder: `Conflict [${repoName}]: ${remoteFile.name}` });
                     if (choice === 'Download' && remoteFile.id) await downloadFile(drive, remoteFile.id, localPath);
                     else if (choice === 'Upload' && remoteFile.id) await updateFile(drive, remoteFile.id, localPath, machineId);
@@ -230,7 +233,7 @@ export async function deleteUntrackedFile(context: vscode.ExtensionContext) {
             const remote = await findRemoteFile(drive, untrackedFolderId, file);
             if (remote && remote.id) {
                 const { data: { parents } } = await drive.files.get({ fileId: remote.id, fields: 'parents' });
-                if (parents?.length && parents[0]) await drive.files.update({ fileId: remote.id, addParents: deletedFolderId, removeParents: parents[0] });
+                 if (parents?.length && parents[0]) await drive.files.update({ fileId: remote.id, addParents: deletedFolderId, removeParents: parents[0] } as any);
             }
             await fs.unlink(path.join(repoRoot, file));
         }

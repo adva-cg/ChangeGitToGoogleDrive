@@ -12,17 +12,38 @@ export async function downloadFile(drive: drive_v3.Drive, fileId: string, destPa
     const dest = fsSync.createWriteStream(destPath);
     const { data: fileStream } = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
     await new Promise((resolve, reject) => {
-        (fileStream as any).pipe(dest)
-            .on('finish', resolve)
-            .on('error', (error: any) => {
-                if (error.code === 'EBUSY' || error.code === 'EPERM') {
-                    vscode.window.showInformationMessage(`File is locked, skipping for now: ${path.basename(destPath)}`);
-                    try { fsSync.unlinkSync(destPath); } catch (e) { }
-                    resolve(undefined);
-                } else {
-                    reject(error);
-                }
-            });
+        let finished = false;
+        
+        const cleanupAndReject = (err: any) => {
+            if (finished) return;
+            finished = true;
+            dest.destroy();
+            fileStream.destroy();
+            reject(err);
+        };
+
+        // Handle errors on the Google Drive read stream
+        fileStream.on('error', cleanupAndReject);
+
+        // Handle finish and errors on the local write stream
+        dest.on('finish', () => {
+            finished = true;
+            resolve(undefined);
+        });
+
+        dest.on('error', (error: any) => {
+            if (finished) return;
+            if (error.code === 'EBUSY' || error.code === 'EPERM') {
+                console.warn(`File is locked, skipping for now: ${path.basename(destPath)}`);
+                try { fsSync.unlinkSync(destPath); } catch (e) { }
+                finished = true;
+                resolve(undefined);
+            } else {
+                cleanupAndReject(error);
+            }
+        });
+
+        (fileStream as any).pipe(dest);
     });
 }
 

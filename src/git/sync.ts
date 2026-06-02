@@ -139,6 +139,7 @@ async function checkRemoteBranchTombstones(context: vscode.ExtensionContext, dri
             const branchName = restoreBranchNameFromDrive(tombstone.name || '');
             const repoName = path.basename(repoRoot);
             if (localBranches.includes(branchName) && tombstone.id && !processedTombstones[tombstone.id]) {
+                if (silent) continue;
                 const choice = await vscode.window.showWarningMessage(
                     `[${repoName}] Ветка '${branchName}' была удалена на другом компьютере. Удалить её локально?`,
                     'Да', 'Нет'
@@ -257,6 +258,7 @@ async function pullCommits(context: vscode.ExtensionContext, drive: drive_v3.Dri
                 const remoteHead = remoteRefs[branchName] || lastHash;
                 if (remoteHead) await context.workspaceState.update(`${LAST_PUSHED_HASH_KEY_PREFIX}${branchName}`, remoteHead);
             } else {
+                if (silent) continue;
                 const choice = await vscode.window.showInformationMessage(`[${repoName}] Found new branch '${branchName}'. Create local?`, 'Yes');
                 if (choice === 'Yes') {
                     let lastHash = '';
@@ -313,16 +315,16 @@ export async function cloneFromGoogleDrive(context: vscode.ExtensionContext) {
     try {
         const rootFolderId = await ensureSingleFolder(drive, null, '.gdrive-git', context);
         const resProjects = await drive.files.list({ q: `'${rootFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`, fields: 'files(id, name)' });
-        const projects = resProjects.data.files || [];
+        const projects = (resProjects.data as any).files || [];
         if (projects.length === 0) return;
-        const selectedProject = await vscode.window.showQuickPick(projects.map(f => ({ label: f.name!, id: f.id! })), { placeHolder: 'Select the project' });
+        const selectedProject = await vscode.window.showQuickPick(projects.map((f: any) => ({ label: f.name!, id: f.id! })), { placeHolder: 'Select the project' }) as any;
         if (!selectedProject) return;
-        const resBundles = await drive.files.list({ q: `name='bundles' and mimeType='application/vnd.google-apps.folder' and '${selectedProject.id}' in parents and trashed=false`, fields: 'files(id)' });
-        if (!resBundles.data.files?.length) return;
-        const bundleFolderId = resBundles.data.files[0].id!;
-        const resRemote = await drive.files.list({ q: `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle'`, fields: 'files(id, name)', orderBy: 'createdTime desc' });
-        if (!resRemote.data.files?.length) return;
-        const selectedBundle = await vscode.window.showQuickPick(resRemote.data.files.map(b => ({ label: b.name!, id: b.id! })), { placeHolder: 'Select the bundle' });
+        const resBundles = await drive.files.list({ q: `name='bundles' and mimeType='application/vnd.google-apps.folder' and '${selectedProject.id}' in parents and trashed=false`, fields: 'files(id)' }) as any;
+        if (!(resBundles.data as any).files?.length) return;
+        const bundleFolderId = (resBundles.data as any).files[0].id!;
+        const resRemote = await drive.files.list({ q: `'${bundleFolderId}' in parents and trashed=false and fileExtension='bundle'`, fields: 'files(id, name)', orderBy: 'createdTime desc' }) as any;
+        if (!(resRemote.data as any).files?.length) return;
+        const selectedBundle = await vscode.window.showQuickPick((resRemote.data as any).files.map((b: any) => ({ label: b.name!, id: b.id! })), { placeHolder: 'Select the bundle' }) as any;
         if (!selectedBundle) return;
         const tempDir = path.join(workspaceRoot, '.gdrive-temp-clone');
         await fs.mkdir(tempDir, { recursive: true });
